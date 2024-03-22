@@ -1,4 +1,4 @@
-# Web-Application-Enumeration-
+# Web-Application-Enumeration-Script
 Just a basic bash script that combines my most commonly used web application tools scripted together to run in the back ground while performing manual web application enumeration. You will need to change the location of some of the tools directories in this script.
 # Tools that need to be installed for this script to work.
 * nslookup
