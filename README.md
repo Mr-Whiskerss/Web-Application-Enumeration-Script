@@ -16,6 +16,8 @@ Add more error handling rather than stop when a tool isnt found the script carri
 Add more tools to find more issues
 Maybe output all tool output to a single file for import into reporting tool.
 Add a feature to grab java script libaries from web application for further investigation. 
+Add virtual hosting enumeration with FFUF tool.
+
 
 
 
