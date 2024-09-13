@@ -87,6 +87,27 @@ def command_exists(command):
 
 # Output file
 output_file = "web_recon_output.md"
+
+###########################
+# TO-DO:
+###########################
+#
+# Support for custom ports
+# Custom output file
+# Set some command-line arguments so you don't have to use an interactive UI for everything: setting target url and port, output file, stealthier modes for nikto, nmap and gobuster (alternative commands, TBD)
+###########################
+# port = None
+# i = 1
+# while i<len(sys.argv):
+#     arg = sys.argv[i]
+#     if arg == '-p' || arg == '--port':
+#
+#         port = sys.argv[i+1]
+#         i += 1
+#
+#     print(f"Argument {i:>6}: {arg}")
+#     i += 1
+
 try:
     with open(output_file, 'w') as f:
         f.write("==================================\n")
@@ -109,7 +130,7 @@ with open(output_file, 'a') as f:
     f.write(f"Target Entered: {target}\n")
 
 # Setup progress bar. This is to ensure you can see what step the tool is at.
-steps = 9
+steps = 10
 progress_bar = tqdm(total=steps, desc=f"{Fore.CYAN}Progress", ncols=100)
 
 # Passive Information Gathering
