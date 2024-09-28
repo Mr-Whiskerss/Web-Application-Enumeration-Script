@@ -120,7 +120,7 @@ try:
         f.write("Performing Active information gathering Stage\n")
         f.write("==================================\n")
 
-    run_command(f"nmap -vv -n -sV -Pn -O -oA full_tcp -p- {target}", output_file)
+    run_command(f"nmap -vv -n -sV -Pn -O -oA full_tcp -p 80,443,8080 {target}", output_file)
     progress_bar.update(1)
 except Exception as e:
     print(f"{Fore.RED}Error during active information gathering: {e}")
