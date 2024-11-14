@@ -106,6 +106,48 @@ output_file = "web_recon_output.md"
 #
 #     print(f"Argument {i:>6}: {arg}")
 #     i += 1
+port = None
+target = None
+arg = None
+argc = len(sys.argv)
+i = 1
+try:
+    while i<argc:
+        arg = sys.argv[i]
+        if arg == '-p' or arg == '--port':
+            i += 1
+            port = int(sys.argv[i])
+            if port < 1:
+                raise ValueError("Invalid port value: " + sys.argv[i])
+        elif arg == '-o' or arg == '--output':
+            i += 1
+            output_file = sys.argv[i]
+            # If the name of the file starts with - we'll asume the user forgot to set this parameter's value
+            if output_file[0] == '-':
+                raise ValueError("")
+        elif arg == '-h' or arg == '--help':
+            print('Usage: python ' + sys.argv[0] + '[-h|--help] [-p|--port=PORT] [-o|--output=OUTPUT_FILE] <target>')
+            print('[-h|--help] : Display this help message.')
+            print('[-p|--port=PORT] : Set the port number.')
+            print('[-o|--output=OUTPUT_FILE] : Use a custom output file. Defaults to web_recon_output.md')
+            print('<target> : Set the target domain/IP address. If not set, the user will be asked to set it.')
+            # if argc == 2:
+            #     sys.exit(0)
+        else:
+            target = arg
+        # print(f"Argument {i:>6}: {arg}")
+        i += 1
+except Exception as e:
+    if arg == '-p' or arg == '--port':
+        if isinstance(e, ValueError):
+            print(f"{Fore.RED}{e}")
+        else:
+            print(f"{Fore.RED}Missing argument: port")
+    elif arg == '-o' or arg == '--output':
+        print(f"{Fore.RED}Missing argument: output file")
+    else:
+        print(f"{Fore.RED}Missing arguments!")
+    sys.exit(1)
 
 try:
     with open(output_file, 'w') as f:
@@ -119,7 +161,10 @@ except Exception as e:
 
 # Prompt user for URL or IP address.
 try:
-    target, target_type = prompt_input("Enter URL or IP address to be tested: ")
+    if not target:
+        target, target_type = prompt_input("Enter URL or IP address to be tested: ")
+    else:
+        target_type = validate_input(target)
     print(f"{Fore.GREEN}Target Entered: {target} ({target_type})")
 except ValueError as e:
     print(e)
@@ -166,7 +211,10 @@ try:
     if input_check == 'y':
         print(f"{Fore.BLUE}Checking for HTTP methods...\n{'='*40}")
         if command_exists("nmap"):
-            run_command(f"nmap --script=http-methods.nse {target}", output_file)
+            if (port is None):
+                run_command(f"nmap --script=http-methods.nse {target}", output_file)
+            else:
+                run_command(f"nmap --script=http-methods.nse -p {port} {target}", output_file)
         else:
             print(f"{Fore.RED}Error: Nmap is not installed.")
             sys.exit(1)
@@ -182,16 +230,16 @@ except Exception as e:
 if target_type == 'domain':
     try:
         print(f"{Fore.BLUE}\nPerforming WhatWeb and Robots.txt Lookup\n{'='*40}")
-        run_command(f"whatweb -v -a 3 {target} | tee what_web_output_web_Recon.txt", output_file)
+        full_target = target if port is None else (target + ":" + str(port))
+        run_command(f"whatweb -v -a 3 {full_target} | tee what_web_output_web_Recon.txt", output_file)  # The command will always try to use HTTP unless we append https:// to the target
         progress_bar.update(1)
-        run_command(f"curl {target}/robots.txt | tee curl_robots_web_Recon.txt", output_file)
+        run_command(f"curl {full_target}/robots.txt | tee curl_robots_web_Recon.txt", output_file)
         progress_bar.update(1)
-        run_command(f"curl https://{target}/robots.txt | tee curl_robots_https_web_Recon.txt", output_file)
+        run_command(f"curl https://{full_target}/robots.txt | tee curl_robots_https_web_Recon.txt", output_file)
         progress_bar.update(1)
     except Exception as e:
         print(f"{Fore.RED}Error during WhatWeb and robots.txt lookup: {e}")
 
-# Directory and File Enumeration
 # Directory and File Enumeration
 try:
     input_check = prompt_yes_no("Perform Dir enumeration?").lower()
@@ -215,13 +263,19 @@ try:
 
         print(f"{Fore.BLUE}Searching for common directories and files...\n{'='*20}")
         if command_exists("gobuster"):
-            run_command(f"gobuster dir -w {wordlist} --timeout 5s --delay 200ms -kqra 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36' -u https://{target} -o gobuster_dir_enumeration_Recon.txt", output_file)
+            if port is None:
+                run_command(f"gobuster dir -w {wordlist} --timeout 5s --delay 200ms -kqra 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36' -u https://{target} -o gobuster_dir_enumeration_Recon.txt", output_file)
+            else:
+                run_command(f"gobuster dir -w {wordlist} --timeout 5s --delay 200ms -kqra 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36' -u https://{target}:{str(port)} -o gobuster_dir_enumeration_Recon.txt", output_file)
         else:
             print(f"{Fore.YELLOW}Warning: Gobuster is not installed. Trying to use Dirbuster instead.")
             if command_exists("dirbuster"):
                 with open(output_file, 'a') as f:
                     f.write("Gobuster not installed. Performing directory enumeration with Dirbuster.\n")
-                run_command(f"dirbuster -H -l {wordlist} -t 5 -v -u https://{target} -r dirbuster_dir_enumeration_Recon.txt", output_file)
+                if port is None:
+                    run_command(f"dirbuster -H -l {wordlist} -t 5 -v -u https://{target} -r dirbuster_dir_enumeration_Recon.txt", output_file)
+                else:
+                    run_command(f"dirbuster -H -l {wordlist} -t 5 -v -u https://{target}:{str(port)} -r dirbuster_dir_enumeration_Recon.txt", output_file)
             else:
                 print(f"{Fore.RED}Error: Gobuster and Dirbuster not installed.")
                 sys.exit(1)
@@ -239,7 +293,10 @@ try:
     if input_check == 'y':
         print(f"{Fore.BLUE}Performing Vulnerability Scan...\n{'='*40}")
         if command_exists("nikto"):
-            run_command(f"nikto -h -c https://{target} | tee nikto_output.txt", output_file)
+            if port is None:
+                run_command(f"nikto -h -c https://{target} | tee nikto_output.txt", output_file)
+            else:
+                run_command(f"nikto -h -c -p {str(port)} https://{target} | tee nikto_output.txt", output_file)
         else:
             print(f"{Fore.RED}Error: Nikto is not installed.")
             sys.exit(1)
@@ -254,7 +311,10 @@ except Exception as e:
 # SSL/TLS Scan
 try:
     print(f"\n{Fore.BLUE}Performing SSL/TLS Scan...\n{'='*40}")
-    run_command(f"sslscan https://{target} | tee ssl_Scan_output.txt", output_file)
+    if port is None:
+        run_command(f"sslscan https://{target} | tee ssl_Scan_output.txt", output_file)
+    else:
+        run_command(f"sslscan https://{target}:{str(port)} | tee ssl_Scan_output.txt", output_file)
     progress_bar.update(1)
     progress_bar.close()
 except Exception as e:
