@@ -23,7 +23,13 @@ The goal of this script is to remove some of the manual work when testing web in
 * Download the Web-Application-Enumeration.V1.0.py file to your local machine
 * chmod +x the file
 * run - python3 ./Web-Application-Enumeration.V1.0.py
-* enter URL or IP address you want to enumerate. 
+* enter URL or IP address you want to enumerate.
+
+* ### Dev version
+* Web-Application-Enumeration.V1.1-dev_Miguel.py
+
+### 100% working version 
+* Web-Application-Enumeration.V1.0.py
 
 #### Up coming changes I wish to make
 
