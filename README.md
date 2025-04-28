@@ -1,47 +1,62 @@
-# Web-Application-Enumeration-Script
-This started off as a basic bash script to run some basic web application enumeration. 
-I have evolved this into a python script. The goal of the script remains the same. The old bash scripts up to version 0.6 can be found in the folder within this repo.
+![image](https://github.com/user-attachments/assets/72200de9-91c6-43b5-8a15-266951917b4b)
 
 
-### Descrpiton 
-This is just a basic python script that can be run agaianst a single IP address running a web server or a URL. I have included some examples below on how to run it. Please ensure the tools list below are installed system wide otherwise you will get some errors. I have tried to include error handling were possible. However this is still in dev stages. 
+🕸️ Web Application Enumeration Script
+A lightweight Python-based script that automates the initial stages of web application enumeration, helping pentesters save time during engagements.
 
-The goal of this script is to remove some of the manual work when testing web infrastructre and providing evdience. This script is only designed to be run in a normal pentest not suitable for redteaming due to the volume of traffic thrown at the host.
+📖 Overview
+Originally developed as a basic Bash script, this project has evolved into a more powerful and flexible Python tool.
+It automates many essential tasks for quickly assessing web infrastructure security — especially during manual pentesting.
+Note: This tool generates considerable traffic and is not recommended for stealthy Red Team operations.
 
+🛠️ Features
+Enumerate single IP addresses or domain names
 
-### Tools that need to be installed for this script to work.
-* nslookup
-* DNSrecon
-* Nmap
-* WhatWeb
-* Curl
-* Nikto
-* TLS Scan
+Automate basic recon and vulnerability detection
 
-### Running the tool
+Integrate commonly used tools into one workflow
 
-* Download the Web-Application-Enumeration.V1.0.py file to your local machine
-* chmod +x the file
-* run - python3 ./Web-Application-Enumeration.V1.0.py
-* enter URL or IP address you want to enumerate.
+Provide evidence quickly for web security assessments
 
-* ### Dev version
-* Web-Application-Enumeration.V1.1-dev_Miguel.py
+📦 Required Tools
+Make sure the following are installed system-wide:
 
-### 100% working version 
-* Web-Application-Enumeration.V1.0.py
+```
+nslookup
+dnsrecon
+nmap
+whatweb
+curl
+nikto
+tlsscan
+```
 
-#### Up coming changes I wish to make
+🚀 Getting Started
+Clone or download the repository.
 
-* Add more tools to find more issues such as dirb for directory brute forcing
-* Add a feature to grab java script libaries from web application for further investigation.
-* Add virtual hosting enumeration options.
-* Add multiple hosts to scan.
+Make the script executable:
+```
+chmod +x Web-Application-Enumeration.V1.0.py
+```
+Run the script:
+```
+python3 ./Web-Application-Enumeration.V1.0.py
+```
+Enter the target IP address or URL when prompted.
 
+🧪 Development Version
+A new dev version (Web-Application-Enumeration.V1.1-dev_Miguel.py) is under active improvement.
 
+You can test it, but for stability, use V1.0.
 
+🔥 Upcoming Features
+Directory brute-forcing (dirb integration)
 
+JavaScript library enumeration
 
+Virtual hosting discovery
 
+Multi-host scanning support
 
-
+📜 License
+This project is licensed under the GNU GPL-3.0 License.
