@@ -1,192 +1,174 @@
-
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
 import os
-import subprocess
+import re
 import sys
+import subprocess
+from enum import Enum
+from argparse import ArgumentParser
 from colorama import Fore, Style, init
 from tqdm import tqdm
-import re
 
-# Initialize colorama for color support. This helps visuals when running the script.
+# Initialize colorama
 init(autoreset=True)
 
-# Helper function.
-def run_command(command, output_file):
-    try:
-        print(f"{Fore.YELLOW}Running: {command}")
-        with open(output_file, 'a') as f:
-            f.write(f"Running command: {command}\n")
-            result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            f.write(result.stdout + result.stderr)
-            if result.returncode == 0:
-                print(f"{Fore.GREEN}Success: {command}")
-            else:
-                print(f"{Fore.RED}Error: {command}. Check output file for details.")
-                f.write(f"Error running command: {command}. Exit code: {result.returncode}\n")
-    except Exception as e:
-        print(f"{Fore.RED}An error occurred while running the command '{command}': {e}")
+# === Configuration ===
+OUTPUT_FILE = "web_recon_output.md"
+PROGRESS_STEPS = 9
 
-# Function to check if the input is a valid domain name or IP address.
-def validate_input(user_input):
-    # Regular expression to check if it's a valid IP address (IPv4)
+class TargetType(Enum):
+    IP = "ip"
+    DOMAIN = "domain"
+
+# === Helper Functions ===
+def log_output(message, file=OUTPUT_FILE):
+    with open(file, 'a') as f:
+        f.write(message + '\n')
+
+def run_command(command, desc, output_file=OUTPUT_FILE):
+    print(f"{Fore.YELLOW}Running: {desc}")
+    log_output(f"Running command: {command}")
+    try:
+        result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        log_output(result.stdout)
+        log_output(result.stderr)
+        if result.returncode == 0:
+            print(f"{Fore.GREEN}Success: {desc}")
+        else:
+            print(f"{Fore.RED}Failed: {desc}")
+            log_output(f"ERROR: {desc} failed with code {result.returncode}")
+    except Exception as e:
+        print(f"{Fore.RED}Exception running {desc}: {e}")
+        log_output(f"EXCEPTION: {e}")
+
+def validate_target(user_input):
     ip_pattern = r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$"
-    # Simple pattern for domain validation (not exhaustive)
     domain_pattern = r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$"
-    
+
     if re.match(ip_pattern, user_input):
-        return 'ip'
+        return TargetType.IP
     elif re.match(domain_pattern, user_input):
-        return 'domain'
+        return TargetType.DOMAIN
     else:
         return None
 
-# Helper function to prompt for user input and validate
-def prompt_input(message):
-    user_input = input(f"{Fore.CYAN}{message}")
-    if not user_input.strip():
-        print(f"{Fore.RED}Input cannot be empty. Please provide a valid input.")
-        sys.exit(1)
-    
-    input_type = validate_input(user_input)
-    
-    if input_type is None:
-        print(f"{Fore.RED}Invalid input. Please provide a valid IP address or domain name.")
-        sys.exit(1)
-    
-    return user_input, input_type
+def prompt_user(prompt_text):
+    return input(f"{Fore.CYAN}{prompt_text}").strip()
 
-# Function to prompt for y/n input
-def prompt_yes_no(message):
+def yes_no(prompt_text):
     while True:
-        user_input = input(f"{Fore.CYAN}{message} (y/n): ").strip().lower()
-        if user_input in ['y', 'n']:
-            return user_input
+        answer = input(f"{Fore.CYAN}{prompt_text} (y/n): ").lower()
+        if answer in ('y', 'n'):
+            return answer == 'y'
         else:
-            print(f"{Fore.RED}Invalid input. Please enter 'y' or 'n'.")
+            print(f"{Fore.RED}Please enter 'y' or 'n'.")
 
-
-# Check if a command exists. Checking if tools exsit please ensure all tools are installed as recommended within the readme.
 def command_exists(command):
     return subprocess.call(f"type {command}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) == 0
 
-# Output file
-output_file = "web_recon_output.md"
-try:
-    with open(output_file, 'w') as f:
-        f.write("==================================\n")
-        f.write("Web Recon Tool\n")
-        f.write("==================================\n")
-    print(f"{Fore.MAGENTA}Output file initialized: {output_file}")
-except Exception as e:
-    print(f"{Fore.RED}Error creating output file: {e}")
-    sys.exit(1)
-
-# Prompt user for URL or IP address. 
-try:
-    target, target_type = prompt_input("Enter URL or IP address to be tested: ")
-    print(f"{Fore.GREEN}Target Entered: {target} ({target_type})")
-except ValueError as e:
-    print(e)
-    sys.exit(1)
-
-with open(output_file, 'a') as f:
-    f.write(f"Target Entered: {target}\n")
-
-# Setup progress bar. This is to ensure you can see what step the tool is at.
-steps = 9
-progress_bar = tqdm(total=steps, desc=f"{Fore.CYAN}Progress", ncols=100)
-
-# Passive Information Gathering
-try:
+# === Recon Functions ===
+def passive_info_gathering(target, target_type, progress_bar):
     print(f"{Fore.BLUE}\nPerforming Passive Information Gathering\n{'='*40}")
-    with open(output_file, 'a') as f:
-        f.write("==================================\n")
-        f.write("Performing Passive information gathering Stage\n")
-        f.write("==================================\n")
+    log_output("=== Passive Information Gathering ===")
 
-    run_command(f"nslookup {target}", output_file)
-    if target_type == 'domain':
-        run_command(f"dnsrecon -d {target}", output_file)
+    run_command(f"nslookup {target}", "NSLookup", OUTPUT_FILE)
+    if target_type == TargetType.DOMAIN:
+        run_command(f"dnsrecon -d {target}", "DNSRecon", OUTPUT_FILE)
     progress_bar.update(1)
-except Exception as e:
-    print(f"{Fore.RED}Error during passive information gathering: {e}")
 
-# Active Information Gathering
-try:
+def active_info_gathering(target, progress_bar):
     print(f"{Fore.BLUE}\nPerforming Active Information Gathering\n{'='*40}")
-    with open(output_file, 'a') as f:
-        f.write("==================================\n")
-        f.write("Performing Active information gathering Stage\n")
-        f.write("==================================\n")
+    log_output("=== Active Information Gathering ===")
 
-    run_command(f"nmap -vv -n -sV -Pn -O -oA full_tcp -p 80,443,8080 {target}", output_file)
+    run_command(f"nmap -vv -n -sV -Pn -O -oA full_tcp -p 80,443,8080 {target}", "Nmap TCP Scan", OUTPUT_FILE)
     progress_bar.update(1)
-except Exception as e:
-    print(f"{Fore.RED}Error during active information gathering: {e}")
 
-# HTTP Methods Check
-try:
-    input_check = prompt_yes_no("Check for allowed HTTP methods? (y/n): ").lower()
-    if input_check == 'y':
+def http_methods_check(target, progress_bar):
+    if yes_no("Check for allowed HTTP methods?"):
         print(f"{Fore.BLUE}Checking for HTTP methods...\n{'='*40}")
         if command_exists("nmap"):
-            run_command(f"nmap --script=http-methods.nse {target}", output_file)
+            run_command(f"nmap --script=http-methods.nse {target}", "HTTP Methods Check", OUTPUT_FILE)
         else:
-            print(f"{Fore.RED}Error: Nmap is not installed.")
+            print(f"{Fore.RED}Nmap is not installed.")
             sys.exit(1)
     else:
         print(f"{Fore.YELLOW}Skipping HTTP methods check.")
-        with open(output_file, 'a') as f:
-            f.write("HTTP methods check skipped.\n")
+        log_output("HTTP methods check skipped.")
     progress_bar.update(1)
-except Exception as e:
-    print(f"{Fore.RED}Error during HTTP methods check: {e}")
 
-# WhatWeb and Robots.txt Lookup (only for domain names)
-if target_type == 'domain':
-    try:
+def whatweb_and_robots(target, target_type, progress_bar):
+    if target_type == TargetType.DOMAIN:
         print(f"{Fore.BLUE}\nPerforming WhatWeb and Robots.txt Lookup\n{'='*40}")
-        run_command(f"whatweb -v -a 3 {target} | tee what_web_output_web_Recon.txt", output_file)
+        run_command(f"whatweb -v -a 3 {target}", "WhatWeb Scan", OUTPUT_FILE)
         progress_bar.update(1)
-        run_command(f"curl {target}/robots.txt | tee curl_robots_web_Recon.txt", output_file)
-        progress_bar.update(1)
-        run_command(f"curl https://{target}/robots.txt | tee curl_robots_https_web_Recon.txt", output_file)
-        progress_bar.update(1)
-    except Exception as e:
-        print(f"{Fore.RED}Error during WhatWeb and robots.txt lookup: {e}")
 
-# Vulnerability Scan
-try:
-    input_check = prompt_yes_no("Perform Vulnerability Scan? (y/n): ").lower()
-    if input_check == 'y':
+        run_command(f"curl {target}/robots.txt", "Robots.txt (HTTP)", OUTPUT_FILE)
+        progress_bar.update(1)
+
+        run_command(f"curl https://{target}/robots.txt", "Robots.txt (HTTPS)", OUTPUT_FILE)
+        progress_bar.update(1)
+
+def vulnerability_scan(target, progress_bar):
+    if yes_no("Perform Vulnerability Scan?"):
         print(f"{Fore.BLUE}Performing Vulnerability Scan...\n{'='*40}")
         if command_exists("nikto"):
-            run_command(f"nikto -h -c https://{target} | tee nikto_output.txt", output_file)
+            run_command(f"nikto -h https://{target}", "Nikto Vulnerability Scan", OUTPUT_FILE)
         else:
-            print(f"{Fore.RED}Error: Nikto is not installed.")
+            print(f"{Fore.RED}Nikto is not installed.")
             sys.exit(1)
     else:
         print(f"{Fore.YELLOW}Skipping Vulnerability Scan.")
-        with open(output_file, 'a') as f:
-            f.write("Vulnerability scan skipped.\n")
+        log_output("Vulnerability scan skipped.")
     progress_bar.update(1)
-except Exception as e:
-    print(f"{Fore.RED}Error during vulnerability scan: {e}")
 
-# SSL/TLS Scan
-try:
+def ssl_tls_scan(target, progress_bar):
     print(f"{Fore.BLUE}Performing SSL/TLS Scan...\n{'='*40}")
-    run_command(f"sslscan https://{target} | tee ssl_Scan_output.txt", output_file)
+    run_command(f"sslscan https://{target}", "SSL/TLS Scan", OUTPUT_FILE)
     progress_bar.update(1)
-except Exception as e:
-    print(f"{Fore.RED}Error during SSL/TLS scan: {e}")
 
-# Script End
-with open(output_file, 'a') as f:
-    f.write("==================================\n")
-    f.write("Script End\n")
-    f.write("==================================\n")
+# === Main Logic ===
+def main():
+    parser = ArgumentParser(description="Web Reconnaissance Tool")
+    parser.add_argument("--target", help="Target domain or IP address", required=False)
+    parser.add_argument("--auto", help="Run without prompts", action="store_true")
+    args = parser.parse_args()
 
-progress_bar.close()
-print(f"{Fore.MAGENTA}\nAll tasks completed! Check the output file for full details of tool output.\n")
+    # Initialize output file
+    with open(OUTPUT_FILE, 'w') as f:
+        f.write("==================================\n")
+        f.write("Web Recon Tool\n")
+        f.write("==================================\n")
+
+    if args.target:
+        target_input = args.target
+    else:
+        target_input = prompt_user("Enter URL or IP address to be tested: ")
+
+    target_type = validate_target(target_input)
+
+    if not target_type:
+        print(f"{Fore.RED}Invalid target. Exiting.")
+        sys.exit(1)
+
+    log_output(f"Target Entered: {target_input}")
+
+    progress_bar = tqdm(total=PROGRESS_STEPS, desc=f"{Fore.CYAN}Progress", ncols=100)
+
+    try:
+        passive_info_gathering(target_input, target_type, progress_bar)
+        active_info_gathering(target_input, progress_bar)
+        http_methods_check(target_input, progress_bar)
+        whatweb_and_robots(target_input, target_type, progress_bar)
+        vulnerability_scan(target_input, progress_bar)
+        ssl_tls_scan(target_input, progress_bar)
+    except Exception as e:
+        print(f"{Fore.RED}Fatal error: {e}")
+        sys.exit(1)
+
+    log_output("=== Script End ===")
+    progress_bar.close()
+
+    print(f"{Fore.MAGENTA}\nAll tasks completed! Check the output file '{OUTPUT_FILE}' for full details.\n")
+
+if __name__ == "__main__":
+    main()
