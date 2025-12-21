@@ -1,5 +1,3 @@
-![image](https://github.com/user-attachments/assets/72200de9-91c6-43b5-8a15-266951917b4b)
-
 # 🕸️ Web Application Enumeration Script
 
 A Python-based reconnaissance tool that automates the initial stages of web application enumeration, helping pentesters save time during engagements.
