@@ -1,240 +1,338 @@
-# 🕸️ Web Application Enumeration Script
+# Web Application Enumeration Script. 
 
-A Python-based reconnaissance tool that automates the initial stages of web application enumeration, helping pentesters save time during engagements.
+> Comprehensive web application enumeration and vulnerability discovery tool for authorised penetration testing engagements.
 
-## 📖 Overview
+---
 
-Originally developed as a basic Bash script, this project has evolved into a powerful and flexible Python tool. It automates essential tasks for quickly assessing web infrastructure security during manual pentesting.
+## Legal Disclaimer
 
-**Note:** This tool generates considerable traffic and is not recommended for stealthy Red Team operations.
+This tool is intended for use against systems you own or have **explicit written authorisation** to test. Unauthorised use against systems you do not have permission to test is illegal and unethical. The author accepts no liability for misuse.
 
-## 🛠️ Features
+---
 
-- **Automatic Tool Detection** - Checks for required tools at startup and offers to install missing ones
-- **Multi-Package Manager Support** - Detects and uses apt, dnf, yum, pacman, brew, go, npm, pip, and gem
-- **Automatic Privilege Escalation** - Detects when sudo is needed and prompts accordingly
-- **Subdomain Enumeration** - Discovers subdomains using Subfinder
-- **Technology Fingerprinting** - Dual detection with WhatWeb and Wappalyzer
-- **Content Discovery** - Directory/file fuzzing with ffuf
-- **Comprehensive SSL/TLS Analysis** - Deep inspection using testssl.sh
-- **DNS Reconnaissance** - NSLookup and DNSRecon integration
-- **Vulnerability Scanning** - Nikto web vulnerability scanner
-- **HTTP Methods Detection** - Identifies allowed HTTP methods
-- **Robots.txt & Sitemap Discovery** - Extracts hidden paths and endpoints
-- **Markdown Report Output** - Clean, readable output format
-- **Progress Tracking** - Visual progress bar for scan status
+## Features
 
-## 📦 Required Tools
+### Architecture
+- **Parallel execution** — independent phases run concurrently via `ThreadPoolExecutor`, significantly reducing total scan time
+- **Resumable scans** — state is written after each phase; interrupted scans can be resumed with `--resume`
+- **Scope enforcement** — provide a scope file of CIDRs and/or domains; any out-of-scope target is hard-blocked before any traffic is sent
+- **Structured findings** — every finding is written to a `.findings.json` file with severity, evidence, and recommendation fields, ready to import into a findings database
+- **Diff mode** — compare findings against a previous scan's JSON to surface new and resolved issues
+- **Proxy support** — all native HTTP calls route through a specified proxy (e.g. Burp Suite) via `--proxy`
+- **Custom User-Agent** — configurable UA string applied to all requests
+- **`shell=False` throughout** — no subprocess injection risk; inputs are validated and sanitised before use
 
-The script will check for these tools and offer to install any that are missing:
+### Phase 1 — Passive Reconnaissance
+| Check | Tool/Method |
+|---|---|
+| DNS enumeration | `nslookup`, `dnsrecon` |
+| WHOIS (flags recently registered domains) | `whois` |
+| ASN & IP range lookup | `ipinfo.io` API |
+| IPv6 address detection & probing | `socket` |
+| Certificate transparency mining | `crt.sh` CDX API |
+| Wayback Machine URL mining | Wayback CDX API |
+| Google dork generation | URL generation + optional Google Custom Search API |
+| Email harvesting | `theHarvester` |
+| Subdomain enumeration | `subfinder` |
+| Subdomain takeover detection | `subjack` + Python fingerprint check |
 
-| Tool | Description | Primary Install |
-|------|-------------|-----------------|
-| `nslookup` | DNS lookup utility | `apt install dnsutils` |
-| `dnsrecon` | DNS enumeration | `apt install dnsrecon` |
-| `nmap` | Network scanner | `apt install nmap` |
-| `whatweb` | Web technology identifier | `apt install whatweb` |
-| `wappalyzer` | Technology profiler | `npm install -g wappalyzer` |
-| `curl` | URL transfer tool | `apt install curl` |
-| `nikto` | Web vulnerability scanner | `apt install nikto` |
-| `testssl.sh` | SSL/TLS testing | `apt install testssl.sh` |
-| `ffuf` | Fast web fuzzer | `apt install ffuf` |
-| `subfinder` | Subdomain discovery | `go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest` |
+### Phase 2 — Active Reconnaissance
+| Check | Tool/Method |
+|---|---|
+| Port scanning (web ports or full `-p-`) | `nmap` |
+| HTTP methods enumeration | `nmap` NSE |
+| WAF detection | `wafw00f` |
+| CDN fingerprinting | Header analysis (Cloudflare, Akamai, Fastly, CloudFront, Azure, Sucuri) |
+| Virtual host fuzzing | `ffuf` in vhost mode with baseline size filtering |
 
-### Python Dependencies
+### Phase 3 — Technology & Content Discovery
+| Check | Tool/Method |
+|---|---|
+| Technology fingerprinting | `whatweb`, `webanalyze` |
+| `robots.txt` / `sitemap.xml` / `security.txt` | Native HTTP |
+| General content discovery | `ffuf` with configurable wordlist |
+| Admin panel discovery | `ffuf` with focused admin path wordlist |
 
+### Phase 4 — HTTP Analysis
+| Check | Method |
+|---|---|
+| Security header grading | HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy |
+| Version disclosure headers | `Server`, `X-Powered-By`, `X-AspNet-Version` |
+| Cookie attribute auditing | `Secure`, `HttpOnly`, `SameSite` |
+| HTTP Basic Auth detection | `WWW-Authenticate` header |
+| HTTP/2 detection | `curl --http2` |
+| Redirect chain analysis | Mixed-content hop detection |
+| CORS misconfiguration | Origin reflection + `ACAC: true` combos |
+| OAuth / OIDC endpoint enumeration | Well-known paths, Keycloak, IdentityServer |
+
+### Phase 5 — Vulnerability Scanning
+| Check | Tool/Method |
+|---|---|
+| SSL/TLS analysis | `testssl.sh` |
+| Web vulnerability scanning | `nikto` |
+| JavaScript secret extraction | 11 regex patterns (AWS keys, JWTs, GitHub tokens, hardcoded passwords, internal IPs, etc.) |
+| GraphQL endpoint detection + introspection | Native HTTP |
+| Path traversal probing | 6 payloads, Linux/Windows indicators |
+| Open redirect probing | 10 common redirect parameters |
+| XXE probing (OOB) | Configurable OOB callback URL (interactsh / Burp Collaborator) |
+| Default credential testing | Tomcat, Jenkins, WordPress, Grafana |
+
+### Phase 6 — Infrastructure
+| Check | Method |
+|---|---|
+| S3 / GCS / Azure blob enumeration | Name permutation + public access probing |
+| Screenshots | `gowitness` |
+
+### Output
+| File | Contents |
+|---|---|
+| `<prefix>.md` | Full markdown report with inline findings (severity, evidence, recommendation) |
+| `<prefix>.findings.json` | Machine-readable structured findings for import into a findings DB |
+| `<prefix>.state.json` | Scan state for `--resume` |
+
+---
+
+## Installation
+
+### Clone
 ```bash
-pip install colorama tqdm
+git clone https://github.com/Mr-Whiskerss/Web-Application-Enumeration-Script.git
+cd Web-Application-Enumeration-Script
 ```
 
-### Wordlists (for ffuf)
+### Python dependencies
+```bash
+pip install requests colorama tqdm
+```
 
-The script auto-detects wordlists from common locations:
-- `/usr/share/wordlists/dirb/common.txt`
-- `/usr/share/seclists/Discovery/Web-Content/common.txt`
-- `/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt`
-- `/opt/SecLists/Discovery/Web-Content/common.txt`
+### External tools
 
-Install SecLists for best results:
+The script checks for tools at runtime and skips phases where the tool is missing. Install what you need:
+
+```bash
+# Kali / Debian
+sudo apt install -y nmap nikto whatweb ffuf subfinder testssl.sh dnsrecon theharvester wafw00f curl gowitness
+
+# Go tools
+go install github.com/ffuf/ffuf/v2@latest
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/haccer/subjack@latest
+go install github.com/rverton/webanalyze/cmd/webanalyze@latest
+go install github.com/sensepost/gowitness@latest
+
+# pip
+pip install wafw00f theHarvester
+```
+
+SecLists is strongly recommended for content discovery and vhost fuzzing:
 ```bash
 sudo apt install seclists
+# or
+git clone https://github.com/danielmiessler/SecLists /opt/SecLists
 ```
 
-## 🔐 Privileges & Sudo
+---
 
-Some scans require root privileges to function properly:
+## Usage
 
-| Scan | Requires Root | Reason |
-|------|---------------|--------|
-| Nmap OS Detection (`-O`) | ✅ Yes | Raw socket access |
-| Nmap Service Scan (`-sV`) | ⚠️ Recommended | Better accuracy |
-| HTTP Methods Check | ⚠️ Recommended | NSE script access |
-| Other scans | ❌ No | Run as normal user |
-
-**The script handles this automatically:**
-- Detects if running as root
-- If not root, automatically prepends `sudo` to commands that need it
-- Displays a warning at startup if not running as root
-
-```
-⚠ Not running as root. Some scans (nmap -O) will use sudo.
-  You may be prompted for your password.
-```
-
-**Running options:**
+### Basic
 ```bash
-# Option 1: Run as normal user (will prompt for sudo when needed)
-python3 web_app.py --target example.com
-
-# Option 2: Run entire script as root (no sudo prompts)
-sudo python3 web_app.py --target example.com
+python3 web_app_pro.py -t example.com
 ```
 
-## 🚀 Getting Started
-
-### Installation
-
-1. Clone the repository:
+### Route through Burp Suite
 ```bash
-git clone https://github.com/Mr-Whiskerss/web-app-enum.git
-cd web-app-enum
+python3 web_app_pro.py -t example.com --proxy http://127.0.0.1:8080
 ```
 
-2. Install Python dependencies:
+### Non-interactive with OOB callback for XXE
 ```bash
-pip install colorama tqdm
+python3 web_app_pro.py -t example.com --auto --oob-url abc123.interactsh.com
 ```
 
-3. Make the script executable:
+### Full port scan with custom rate limiting
 ```bash
-chmod +x web_app.py
+python3 web_app_pro.py -t example.com --full-ports --rate 20 --delay 0.1
 ```
 
-### Usage
-
-**Interactive mode:**
+### With scope enforcement
 ```bash
-python3 web_app.py
+python3 web_app_pro.py -t example.com --scope-file scope.txt
 ```
 
-**With target specified:**
+### With Google dork automation
 ```bash
-python3 web_app.py --target example.com
+python3 web_app_pro.py -t example.com --google-api-key YOUR_KEY --google-cx YOUR_CX
 ```
 
-**Custom output file:**
+### Resume an interrupted scan
 ```bash
-python3 web_app.py --target example.com -o report.md
+python3 web_app_pro.py -t example.com --resume
 ```
 
-**Skip tool dependency check:**
+### Diff against a previous scan
 ```bash
-python3 web_app.py --target example.com --skip-check
+python3 web_app_pro.py -t example.com --diff previous.findings.json
 ```
 
-### Command Line Options
+---
 
-| Option | Description |
-|--------|-------------|
-| `--target` | Target domain or IP address |
-| `-o, --output` | Output file name (default: `web_recon_output.md`) |
-| `--skip-check` | Skip tool dependency check |
-| `--auto` | Run without prompts (planned) |
+## All Flags
 
-## 📋 Scan Phases
+| Flag | Default | Description |
+|---|---|---|
+| `-t`, `--target` | — | Target domain or IP (required) |
+| `-o`, `--output` | `webrecon` | Output file prefix |
+| `--auto`, `-a` | off | Non-interactive mode — skips `y/n` prompts |
+| `--proxy` | — | Proxy URL, e.g. `http://127.0.0.1:8080` |
+| `--user-agent` | Chrome 120 UA | Custom User-Agent string |
+| `--timeout` | `10` | HTTP request timeout in seconds |
+| `--rate` | `50` | ffuf thread rate |
+| `--delay` | `0.0` | Delay between ffuf requests in seconds |
+| `--oob-url` | — | OOB callback host for XXE/SSRF probes |
+| `--scope-file` | — | Scope file: CIDRs or domains, one per line |
+| `--full-ports` | off | Run full `-p-` nmap scan instead of web port selection |
+| `--google-api-key` | — | Google Custom Search API key |
+| `--google-cx` | — | Google Custom Search Engine ID |
+| `--diff` | — | Previous `.findings.json` to compare against |
+| `--resume` | off | Resume from last completed phase |
+| `--fresh` | off | Clear saved state and start from scratch |
+| `--threads` | `5` | Number of parallel phase threads |
+| `-v`, `--verbose` | off | Show tool stderr output in report |
 
-The script runs through these phases:
+---
 
-| Phase | Description | Tools Used |
-|-------|-------------|------------|
-| 1. Passive Recon | DNS lookups and enumeration | nslookup, dnsrecon |
-| 2. Subdomain Enumeration | Discover subdomains (domains only) | subfinder |
-| 3. Active Recon | Port scanning and service detection | nmap |
-| 4. HTTP Methods | Identify allowed HTTP methods | nmap NSE |
-| 5. Technology Detection | Fingerprint web technologies | whatweb, wappalyzer |
-| 6. Robots/Sitemap | Extract paths from config files | curl |
-| 7. Content Discovery | Directory and file fuzzing | ffuf |
-| 8. Vulnerability Scan | Web vulnerability detection | nikto |
-| 9. SSL/TLS Analysis | Certificate and cipher analysis | testssl.sh |
-
-## 📄 Sample Output
+## Scope File Format
 
 ```
-╔══════════════════════════════════════════════════════════════╗
-║                  Web Reconnaissance Tool                     ║
-║                                                              ║
-║  Tools: nmap, nikto, whatweb, wappalyzer, subfinder,        ║
-║         ffuf, testssl.sh, dnsrecon, curl                    ║
-╚══════════════════════════════════════════════════════════════╝
+# CIDRs and/or domains, one per line
+# Lines starting with # are ignored
 
-⚠ Not running as root. Some scans (nmap -O) will use sudo.
-  You may be prompted for your password.
-
-==================================================
-Checking Required Tools
-==================================================
-
-[✓] nslookup - DNS lookup utility
-[✓] dnsrecon - DNS enumeration tool
-[✓] nmap - Network scanner
-[✓] whatweb - Web technology identifier
-[✓] curl - URL transfer tool
-[✓] nikto - Web vulnerability scanner
-[✓] testssl - SSL/TLS testing tool
-[✓] ffuf - Fast web fuzzer for content discovery
-[✓] subfinder - Subdomain discovery tool
-[✓] wappalyzer - Technology profiler for websites
-
-All required tools are installed!
-
-Enter URL or IP address to be tested: example.com
-
-Target: example.com (domain)
-Output: web_recon_output.md
-
-Overall Progress: 100%|████████████████████████| 13/13
+10.10.10.0/24
+192.168.1.0/24
+example.com
+*.example.com
 ```
 
-## 📊 Output Report
+Targets not matching any entry are hard-blocked before any traffic is sent. Applies to the primary target and to any subdomains discovered during the scan.
 
-The script generates a Markdown report (`web_recon_output.md`) containing:
+---
 
-- Target information
-- DNS lookup results
-- Discovered subdomains
-- Open ports and services
-- Detected technologies
-- robots.txt and sitemap.xml contents
-- Discovered directories/files
-- Vulnerability findings
-- SSL/TLS configuration details
+## Output Structure
 
-## 🔥 Upcoming Features
+### Markdown report (`.md`)
+Each finding is written inline with severity, phase, evidence block, and recommendation:
 
-- [ ] Nuclei vulnerability scanning integration
-- [ ] httpx HTTP probing
-- [ ] JavaScript library enumeration
-- [ ] Virtual hosting discovery
-- [ ] Multi-host scanning support
-- [ ] HTML report generation
-- [ ] API endpoint discovery
-- [ ] Screenshot capture with gowitness
-- [ ] Automated mode (`--auto` flag)
+```markdown
+### 🔴 [HIGH] Missing Header: strict-transport-security
+**Phase:** header_analysis  |  **Time:** 2025-01-15T14:32:01
 
-## 🤝 Contributing
+**Description:** Response does not include `strict-transport-security`.
 
-Contributions are welcome! Feel free to:
+**Evidence:**
+```
+Checked: https://example.com
+```
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/new-tool`)
-3. Commit your changes (`git commit -m 'Add new tool integration'`)
-4. Push to the branch (`git push origin feature/new-tool`)
-5. Open a Pull Request
+**Recommendation:** Add: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+```
 
-## ⚠️ Disclaimer
+### Findings JSON (`.findings.json`)
+```json
+[
+  {
+    "title": "Missing Header: strict-transport-security",
+    "severity": "HIGH",
+    "description": "Response does not include `strict-transport-security`.",
+    "evidence": "Checked: https://example.com",
+    "recommendation": "Add: Strict-Transport-Security: max-age=31536000; ...",
+    "phase": "header_analysis",
+    "timestamp": "2025-01-15T14:32:01"
+  }
+]
+```
 
-This tool is intended for authorized security testing only. Always obtain proper authorization before scanning any systems you do not own. Unauthorized access to computer systems is illegal.
+The findings JSON is structured to import directly into a pentest findings database or be consumed by a report generator.
 
-## 📜 License
+---
 
-This project is licensed under the GNU GPL-3.0 License.
+## Diff Mode
+
+Run two scans against the same target (e.g. before and after a remediation window) and compare:
+
+```bash
+# First scan
+python3 web_app_pro.py -t example.com -o scan_jan
+
+# Second scan, diffed against the first
+python3 web_app_pro.py -t example.com -o scan_feb --diff scan_jan.findings.json
+```
+
+The final report section will list:
+- **New** findings not present in the previous scan
+- **Resolved** findings from the previous scan no longer present
+- **Unchanged** finding count
+
+---
+
+## Resuming Scans
+
+State is written to `<prefix>.state.json` after each phase completes. If a scan is interrupted (Ctrl+C, timeout, connection drop), re-run with the same output prefix and `--resume`:
+
+```bash
+python3 web_app_pro.py -t example.com -o myrecon --resume
+```
+
+Completed phases are skipped. Use `--fresh` to clear the state and restart from scratch.
+
+---
+
+## Notes
+
+- **XXE probing** requires `--oob-url` pointing to an out-of-band callback host (interactsh, Burp Collaborator, etc.). Without it the phase is skipped cleanly.
+- **Google dork automation** requires a Google Custom Search API key and engine ID. Without them, dork URLs are generated and logged for manual review.
+- **`webanalyze`** is used in place of the deprecated `wappalyzer` CLI.
+- Nmap OS detection (`-O`) will prompt for `sudo` if not running as root.
+- Content discovery and Nikto prompt for confirmation in interactive mode. Use `--auto` to suppress all prompts.
+- Screenshots are saved to `./screenshots/` relative to the working directory.
+
+---
+
+## Changelog
+
+### v2.0
+- Full rewrite in structured Python with dataclasses and typed interfaces
+- Parallelised phase execution (`ThreadPoolExecutor`)
+- Scope enforcement with CIDR and domain allowlists
+- Resumable scan state
+- Diff mode for before/after comparisons
+- Proxy and custom User-Agent support throughout all native HTTP calls
+- `shell=False` on all subprocess calls; input sanitisation
+- HTTP scheme auto-detection with HTTPS-first fallback
+- Structured `.findings.json` output with severity tags
+- New: certificate transparency (crt.sh), Wayback Machine URL mining
+- New: Google dork generation and optional API automation
+- New: email harvesting (theHarvester)
+- New: subdomain takeover fingerprint check (Python-native + subjack)
+- New: WAF/CDN fingerprinting (wafw00f + header analysis)
+- New: virtual host fuzzing (ffuf)
+- New: security header grading (6 OWASP headers)
+- New: cookie attribute auditing
+- New: CORS misconfiguration detection
+- New: OAuth/OIDC endpoint enumeration
+- New: JavaScript secret extraction (11 patterns)
+- New: GraphQL endpoint detection + introspection probe
+- New: path traversal probing
+- New: open redirect probing
+- New: XXE probing with OOB callback support
+- New: default credential testing (Tomcat, Jenkins, WordPress, Grafana)
+- New: cloud storage bucket enumeration (S3, GCS, Azure)
+- New: screenshots via gowitness
+- New: ASN and IPv6 enumeration
+- New: admin panel focused discovery wordlist
+- Replaced deprecated `wappalyzer` CLI with `webanalyze`
+- Expanded nmap port list to cover common non-standard web ports
+- Diff mode output in final report summary
+
+### v1.0
+- Initial release — sequential scan phases wrapping nmap, nikto, whatweb, wappalyzer, subfinder, ffuf, testssl, dnsrecon, curl
