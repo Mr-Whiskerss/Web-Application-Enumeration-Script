@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WebRecon Pro v2.0 — Comprehensive Web Application Enumeration Tool
+WebRecon v2.0 — Comprehensive Web Application Enumeration Tool
 Improvements over v1: parallelism, scope enforcement, structured findings,
 resumable state, diff mode, proxy/UA support, and extensive new checks.
 """
