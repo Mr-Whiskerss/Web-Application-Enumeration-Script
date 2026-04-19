@@ -1,338 +1,373 @@
-# Web Application Enumeration Script. 
+# WebRecon
 
-> Comprehensive web application enumeration and vulnerability discovery tool for authorised penetration testing engagements.
+> Comprehensive web application reconnaissance and vulnerability enumeration framework
 
----
+**WebRecon** is a single-file Python tool that automates the web-application phase of an external or internal pentest — passive OSINT, active recon, content discovery, technology fingerprinting, vulnerability probing, and reporting — with resumable state, authenticated scanning, and multi-format output.
 
-## Legal Disclaimer
-
-This tool is intended for use against systems you own or have **explicit written authorisation** to test. Unauthorised use against systems you do not have permission to test is illegal and unethical. The author accepts no liability for misuse.
+It's a glue layer around the tools you already use (nuclei, katana, arjun, ffuf, nmap, wpscan, wafw00f, subfinder, etc.) plus ~2800 lines of first-party Python checks covering the gaps those tools leave: JWT deep analysis, CORS, security headers, SSRF/SSTI/CRLF/host-header injection, cloud-metadata probing, default credentials, favicon-hash pivoting, JS secret extraction, and more.
 
 ---
 
 ## Features
 
-### Architecture
-- **Parallel execution** — independent phases run concurrently via `ThreadPoolExecutor`, significantly reducing total scan time
-- **Resumable scans** — state is written after each phase; interrupted scans can be resumed with `--resume`
-- **Scope enforcement** — provide a scope file of CIDRs and/or domains; any out-of-scope target is hard-blocked before any traffic is sent
-- **Structured findings** — every finding is written to a `.findings.json` file with severity, evidence, and recommendation fields, ready to import into a findings database
-- **Diff mode** — compare findings against a previous scan's JSON to surface new and resolved issues
-- **Proxy support** — all native HTTP calls route through a specified proxy (e.g. Burp Suite) via `--proxy`
-- **Custom User-Agent** — configurable UA string applied to all requests
-- **`shell=False` throughout** — no subprocess injection risk; inputs are validated and sanitised before use
+### Passive reconnaissance
+- DNS, WHOIS, ASN lookups (domain-age flag, IPv6 presence check)
+- Certificate transparency (crt.sh)
+- Wayback Machine URL + parameter mining — parameters are fed into later fuzzing phases
+- Google dork URL generation (+ optional Custom Search API automation)
+- Email harvesting (theHarvester)
 
-### Phase 1 — Passive Reconnaissance
-| Check | Tool/Method |
-|---|---|
-| DNS enumeration | `nslookup`, `dnsrecon` |
-| WHOIS (flags recently registered domains) | `whois` |
-| ASN & IP range lookup | `ipinfo.io` API |
-| IPv6 address detection & probing | `socket` |
-| Certificate transparency mining | `crt.sh` CDX API |
-| Wayback Machine URL mining | Wayback CDX API |
-| Google dork generation | URL generation + optional Google Custom Search API |
-| Email harvesting | `theHarvester` |
-| Subdomain enumeration | `subfinder` |
-| Subdomain takeover detection | `subjack` + Python fingerprint check |
+### Active reconnaissance
+- Subdomain enumeration (subfinder) with scope-aware filtering
+- Subdomain takeover detection (subjack + in-tree fingerprints covering S3, GitHub Pages, Heroku, Azure, Shopify, Fastly, Surge, Bitbucket)
+- Virtual-host fuzzing (ffuf)
+- Port scanning (nmap, web-focused default / `--full-ports` for all)
+- WAF / CDN fingerprinting (wafw00f + header-based detection of Cloudflare, CloudFront, Akamai, Fastly, Azure CDN, Sucuri)
+- Favicon hash (mmh3 for Shodan pivoting + SHA-256 fallback)
 
-### Phase 2 — Active Reconnaissance
-| Check | Tool/Method |
-|---|---|
-| Port scanning (web ports or full `-p-`) | `nmap` |
-| HTTP methods enumeration | `nmap` NSE |
-| WAF detection | `wafw00f` |
-| CDN fingerprinting | Header analysis (Cloudflare, Akamai, Fastly, CloudFront, Azure, Sucuri) |
-| Virtual host fuzzing | `ffuf` in vhost mode with baseline size filtering |
+### Technology & content discovery
+- Technology detection (whatweb, webanalyze)
+- Tech-specific playbooks — kicks off **only** for detected stacks:
+  - **WordPress** → wpscan (plugin / user enum)
+  - **Drupal** → droopescan
+  - **Joomla** → joomscan
+  - **Laravel** → `.env`, Telescope, Ignition, debugbar, Horizon probes
+  - **Spring Boot** → actuator sweep (env, heapdump, mappings, trace, etc.)
+  - **Tomcat** → manager / host-manager / examples
+  - **Jenkins** → `/script`, `/manage`, `/asynchPeople/`
+- robots.txt, sitemap.xml, security.txt, well-known endpoints
+- URL crawling (katana) — feeds URLs + params into downstream phases
+- Content discovery (ffuf) — general + admin-panel wordlist
+- Hidden parameter discovery (Arjun) — runs against base URL + crawled endpoints
 
-### Phase 3 — Technology & Content Discovery
-| Check | Tool/Method |
-|---|---|
-| Technology fingerprinting | `whatweb`, `webanalyze` |
-| `robots.txt` / `sitemap.xml` / `security.txt` | Native HTTP |
-| General content discovery | `ffuf` with configurable wordlist |
-| Admin panel discovery | `ffuf` with focused admin path wordlist |
+### HTTP analysis
+- Security header audit (HSTS, CSP, X-Frame-Options, X-CTO, Referrer-Policy, Permissions-Policy)
+- Cookie audit (Secure, HttpOnly, SameSite)
+- Information disclosure (Server, X-Powered-By, X-AspNet-Version)
+- CORS misconfiguration (origin reflection, wildcard + credentials)
+- **Host header injection** (Host, X-Forwarded-Host, X-Host canary reflection)
+- **CRLF injection** (common + crawler-discovered parameters)
+- OAuth / OIDC endpoint discovery (`.well-known/*`, JWKS, token endpoints)
+- **JWT deep analysis**:
+  - `alg:none` acceptance
+  - Weak-HMAC cracking (12-secret wordlist — `secret`, `password`, `changeme`, etc.)
+  - `kid` header injection / path-traversal hints
+  - Missing / excessive `exp` claims
 
-### Phase 4 — HTTP Analysis
-| Check | Method |
-|---|---|
-| Security header grading | HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy |
-| Version disclosure headers | `Server`, `X-Powered-By`, `X-AspNet-Version` |
-| Cookie attribute auditing | `Secure`, `HttpOnly`, `SameSite` |
-| HTTP Basic Auth detection | `WWW-Authenticate` header |
-| HTTP/2 detection | `curl --http2` |
-| Redirect chain analysis | Mixed-content hop detection |
-| CORS misconfiguration | Origin reflection + `ACAC: true` combos |
-| OAuth / OIDC endpoint enumeration | Well-known paths, Keycloak, IdentityServer |
+### Vulnerability scanning
+- **Nuclei** — CVE / misconfig templates with severity filter and intrusive-tag gating
+- **SSRF** — OOB-based with unique markers per parameter + cloud metadata sweep (AWS, GCP, DigitalOcean, file://)
+- **SSTI** — Jinja2, Twig, FreeMarker, ERB, Thymeleaf, Razor with arithmetic canary
+- **XXE** — classic external entity, blind parameter-entity via external DTD, SOAP envelope, SVG-embedded
+- **Path traversal** — common encodings + per-parameter testing
+- **Open redirect** — standard + crawler-discovered redirect-like params
+- **Default credentials** — Tomcat (Basic), Jenkins, WordPress (form), Grafana-style (JSON) — explicit success/failure text checks, no false positives from generic 200s
+- **JS secret extraction** — AWS access keys, API keys, tokens, JWTs, private keys, Google/Slack/GitHub tokens, Basic-auth-in-URL, hardcoded passwords, internal IPs
+- GraphQL endpoint detection + introspection probe
+- SSL/TLS analysis (testssl.sh)
+- Nikto (optional, gated)
 
-### Phase 5 — Vulnerability Scanning
-| Check | Tool/Method |
-|---|---|
-| SSL/TLS analysis | `testssl.sh` |
-| Web vulnerability scanning | `nikto` |
-| JavaScript secret extraction | 11 regex patterns (AWS keys, JWTs, GitHub tokens, hardcoded passwords, internal IPs, etc.) |
-| GraphQL endpoint detection + introspection | Native HTTP |
-| Path traversal probing | 6 payloads, Linux/Windows indicators |
-| Open redirect probing | 10 common redirect parameters |
-| XXE probing (OOB) | Configurable OOB callback URL (interactsh / Burp Collaborator) |
-| Default credential testing | Tomcat, Jenkins, WordPress, Grafana |
+### Infrastructure
+- Cloud bucket enumeration (S3, GCS, Azure Blob — 12 name-mutation patterns)
+- Headless screenshots (gowitness)
 
-### Phase 6 — Infrastructure
-| Check | Method |
-|---|---|
-| S3 / GCS / Azure blob enumeration | Name permutation + public access probing |
-| Screenshots | `gowitness` |
-
-### Output
-| File | Contents |
-|---|---|
-| `<prefix>.md` | Full markdown report with inline findings (severity, evidence, recommendation) |
-| `<prefix>.findings.json` | Machine-readable structured findings for import into a findings DB |
-| `<prefix>.state.json` | Scan state for `--resume` |
+### Pentester features
+- **Resumable scans** (JSON state file — survives Ctrl-C / reboot)
+- **Scope enforcement** (IPv4 + IPv6 CIDRs + domains, with DNS-resolution scope check)
+- **Scan profiles**: `recon` / `active` / `full` / `stealth`
+- **Authenticated scanning** — cookies, arbitrary headers (Bearer, API keys), session revalidation
+- **Adaptive rate limiting** — backs off exponentially on 429/503, global across all threads
+- **Proxy-aware** — Burp, ZAP, mitmproxy (HTTP + SOCKS)
+- **Diff mode** — delta findings against a previous scan
+- **Webhook notifications** — Discord / Slack (auto-detected), configurable severity threshold
+- **PentestDB integration** — POST findings to your self-hosted pentest findings database
+- **Output formats** — Markdown, filterable HTML, JSON
 
 ---
 
 ## Installation
 
-### Clone
 ```bash
-git clone https://github.com/Mr-Whiskerss/Web-Application-Enumeration-Script.git
-cd Web-Application-Enumeration-Script
-```
+# Clone
+git clone https://github.com/Mr-Whiskerss/WebRecon.git
+cd WebRecon
 
-### Python dependencies
-```bash
-pip install requests colorama tqdm
-```
+# Python dependencies
+pip install requests colorama tqdm mmh3 arjun
 
-### External tools
-
-The script checks for tools at runtime and skips phases where the tool is missing. Install what you need:
-
-```bash
-# Kali / Debian
-sudo apt install -y nmap nikto whatweb ffuf subfinder testssl.sh dnsrecon theharvester wafw00f curl gowitness
-
-# Go tools
-go install github.com/ffuf/ffuf/v2@latest
+# Go tools (install what you plan to use)
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-go install github.com/haccer/subjack@latest
-go install github.com/rverton/webanalyze/cmd/webanalyze@latest
-go install github.com/sensepost/gowitness@latest
+nuclei -update-templates
 
-# pip
-pip install wafw00f theHarvester
+# System packages (Debian / Ubuntu example)
+sudo apt install nmap nikto whatweb ffuf wafw00f theharvester dnsrecon \
+                 whois dnsutils testssl.sh
+
+# CMS-specific (install as needed)
+sudo gem install wpscan                       # WordPress
+pip install droopescan                        # Drupal
+# joomscan → https://github.com/OWASP/joomscan
+# gowitness → https://github.com/sensepost/gowitness
 ```
 
-SecLists is strongly recommended for content discovery and vhost fuzzing:
+WebRecon degrades gracefully — any missing external tool causes its phase to log a warning and skip. The scan continues.
+
+---
+
+## Quick start
+
 ```bash
-sudo apt install seclists
-# or
-git clone https://github.com/danielmiessler/SecLists /opt/SecLists
+# Full scan, interactive prompts
+./web_app.py -t example.com
+
+# Fully automated, through Burp, with OOB callback
+./web_app.py -t example.com --auto \
+  --proxy http://127.0.0.1:8080 \
+  --oob-url abc.oast.live
+
+# Authenticated scan
+./web_app.py -t app.example.com --auto \
+  --cookie "session=abc123; csrf=xyz" \
+  --auth-check-url https://app.example.com/account \
+  --auth-check-text "Sign out"
+
+# Passive-only OSINT pass
+./web_app.py -t example.com --profile recon --auto
+
+# Low-and-slow
+./web_app.py -t example.com --profile stealth --auto
 ```
 
 ---
 
-## Usage
+## Scan profiles
 
-### Basic
+| Profile   | Phases run                               | Rate / threads   | Intrusive |
+|-----------|------------------------------------------|------------------|-----------|
+| `recon`   | Phase 1 only (passive)                   | default          | disabled  |
+| `active`  | Phases 1–4 (passive + active + HTTP)     | default          | enabled   |
+| `full`    | All phases *(default)*                   | default          | enabled   |
+| `stealth` | All phases                               | ≤10 req/s, 2 thr | disabled  |
+
+`--no-intrusive` can be applied to any profile to skip Nikto and nuclei-tagged `intrusive` / `fuzz` / `dos` templates.
+
+---
+
+## Authentication
+
+Authenticated scanning supports cookies, arbitrary headers, and session revalidation:
+
 ```bash
-python3 web_app_pro.py -t example.com
+./web_app.py -t app.example.com --auto \
+  --cookie "session=abc123" \
+  --header "Authorization: Bearer eyJhbGc..." \
+  --header "X-API-Key: deadbeef" \
+  --auth-check-url https://app.example.com/me \
+  --auth-check-text "your_username"
 ```
 
-### Route through Burp Suite
+The auth-check runs at scan start — it hits `--auth-check-url` and asserts `--auth-check-text` is in the response. If the session is invalid, you get a warning (the scan continues — the warning is yours to act on).
+
+Cookies and headers are threaded through to **katana**, **arjun**, **ffuf**, and **nuclei** where those tools support the relevant flags.
+
+---
+
+## Examples
+
+**Pentest iteration with resume**
 ```bash
-python3 web_app_pro.py -t example.com --proxy http://127.0.0.1:8080
+./web_app.py -t client.corp --auto --oob-url $(interactsh-client -json | jq -r .url)
+# [Ctrl-C / reboot / sleep]
+./web_app.py -t client.corp --resume
 ```
 
-### Non-interactive with OOB callback for XXE
+**Retest with diff report**
 ```bash
-python3 web_app_pro.py -t example.com --auto --oob-url abc123.interactsh.com
+./web_app.py -t client.corp --auto --diff previous_scan.findings.json
+# Summary section will include New / Resolved / Unchanged
 ```
 
-### Full port scan with custom rate limiting
+**Discord alerts for HIGH+ findings**
 ```bash
-python3 web_app_pro.py -t example.com --full-ports --rate 20 --delay 0.1
+./web_app.py -t client.corp --auto \
+  --webhook-url https://discord.com/api/webhooks/.../... \
+  --webhook-threshold HIGH
 ```
 
-### With scope enforcement
+**Auto-push findings to self-hosted PentestDB**
 ```bash
-python3 web_app_pro.py -t example.com --scope-file scope.txt
+./web_app.py -t client.corp --auto \
+  --pentestdb-url http://pi.lan:5000 \
+  --pentestdb-token "$PENTESTDB_TOKEN"
 ```
 
-### With Google dork automation
+**Bug bounty — wide nuclei, skip Nikto, full ports**
 ```bash
-python3 web_app_pro.py -t example.com --google-api-key YOUR_KEY --google-cx YOUR_CX
+./web_app.py -t target.bb --auto \
+  --full-ports \
+  --nuclei-severity low,medium,high,critical \
+  --no-intrusive
 ```
 
-### Resume an interrupted scan
+**Scope-locked engagement**
 ```bash
-python3 web_app_pro.py -t example.com --resume
+cat > scope.txt <<'EOF'
+10.0.0.0/8
+192.168.0.0/16
+2001:db8::/32
+client.corp
+EOF
+
+./web_app.py -t client.corp --auto --scope-file scope.txt
+# Out-of-scope subdomains discovered during enum are filtered automatically
 ```
 
-### Diff against a previous scan
+**Internal engagement via SSH tunnel + Burp**
 ```bash
-python3 web_app_pro.py -t example.com --diff previous.findings.json
+ssh -D 1080 jumpbox.client.corp &
+./web_app.py -t internal.app.client.corp --auto \
+  --proxy socks5://127.0.0.1:1080
 ```
 
 ---
 
-## All Flags
+## CLI reference
 
-| Flag | Default | Description |
-|---|---|---|
-| `-t`, `--target` | — | Target domain or IP (required) |
-| `-o`, `--output` | `webrecon` | Output file prefix |
-| `--auto`, `-a` | off | Non-interactive mode — skips `y/n` prompts |
-| `--proxy` | — | Proxy URL, e.g. `http://127.0.0.1:8080` |
-| `--user-agent` | Chrome 120 UA | Custom User-Agent string |
-| `--timeout` | `10` | HTTP request timeout in seconds |
-| `--rate` | `50` | ffuf thread rate |
-| `--delay` | `0.0` | Delay between ffuf requests in seconds |
-| `--oob-url` | — | OOB callback host for XXE/SSRF probes |
-| `--scope-file` | — | Scope file: CIDRs or domains, one per line |
-| `--full-ports` | off | Run full `-p-` nmap scan instead of web port selection |
-| `--google-api-key` | — | Google Custom Search API key |
-| `--google-cx` | — | Google Custom Search Engine ID |
-| `--diff` | — | Previous `.findings.json` to compare against |
-| `--resume` | off | Resume from last completed phase |
-| `--fresh` | off | Clear saved state and start from scratch |
-| `--threads` | `5` | Number of parallel phase threads |
-| `-v`, `--verbose` | off | Show tool stderr output in report |
+Run `./web_app.py --help` for the full list.
 
----
-
-## Scope File Format
-
-```
-# CIDRs and/or domains, one per line
-# Lines starting with # are ignored
-
-10.10.10.0/24
-192.168.1.0/24
-example.com
-*.example.com
-```
-
-Targets not matching any entry are hard-blocked before any traffic is sent. Applies to the primary target and to any subdomains discovered during the scan.
+| Flag                       | Purpose                                                     |
+|----------------------------|-------------------------------------------------------------|
+| `-t, --target`             | Target (domain / IP / host:port)                            |
+| `-o, --output`             | Output prefix (default `webrecon`)                          |
+| `--auto`                   | Skip all interactive prompts                                |
+| `--profile`                | `recon` / `active` / `full` / `stealth`                     |
+| `--proxy`                  | HTTP / SOCKS proxy                                          |
+| `--oob-url`                | Out-of-band callback host (interactsh) for XXE/SSRF         |
+| `--scope-file`             | Scope enforcement file (CIDRs v4/v6 + domains)              |
+| `--cookie`                 | Session cookie(s)                                           |
+| `--header`                 | Extra request header (repeatable)                           |
+| `--auth-check-url/-text`   | Session revalidation before scan                            |
+| `--webhook-url`            | Discord / Slack webhook (auto-detected)                     |
+| `--webhook-threshold`      | Minimum severity to notify (default `HIGH`)                 |
+| `--pentestdb-url/-token`   | Self-hosted PentestDB integration                           |
+| `--diff`                   | Previous findings JSON (delta report)                       |
+| `--resume` / `--fresh`     | Resume interrupted / clear state                            |
+| `--full-ports`             | Full TCP port scan (`-p-`)                                  |
+| `--no-intrusive`           | Skip Nikto + nuclei intrusive templates                     |
+| `--nuclei-severity`        | Nuclei severity filter                                      |
+| `--google-api-key/-cx`     | Google Custom Search (automated dorking)                    |
+| `--threads`                | Parallel phase threads                                      |
+| `--rate` / `--delay`       | Per-phase rate limit / inter-request delay                  |
+| `--no-html`                | Skip HTML report                                            |
+| `-v, --verbose`            | Show tool stderr                                            |
 
 ---
 
-## Output Structure
+## Output
 
-### Markdown report (`.md`)
-Each finding is written inline with severity, phase, evidence block, and recommendation:
+A single scan produces:
 
-```markdown
-### 🔴 [HIGH] Missing Header: strict-transport-security
-**Phase:** header_analysis  |  **Time:** 2025-01-15T14:32:01
+| File                          | Contents                                                    |
+|-------------------------------|-------------------------------------------------------------|
+| `<prefix>.md`                 | Markdown report — full tool output + findings               |
+| `<prefix>.report.html`        | Self-contained filterable HTML report (no server required)  |
+| `<prefix>.findings.json`      | Structured findings (JSON list of `Finding` objects)        |
+| `<prefix>.state.json`         | Resume state (phase checkpoints)                            |
 
-**Description:** Response does not include `strict-transport-security`.
+Findings are categorised:
 
-**Evidence:**
-```
-Checked: https://example.com
-```
+| Severity   | When used                                                          |
+|------------|--------------------------------------------------------------------|
+| `CRITICAL` | Confirmed RCE, auth bypass, default creds, SSRF→metadata, SSTI     |
+| `HIGH`     | Subdomain takeover, exposed admin, LFI, JWT weak secret            |
+| `MEDIUM`   | CORS misconfig, missing CSP, weak cookies, open redirect           |
+| `LOW`      | Missing low-impact headers, information disclosure                 |
+| `INFO`     | Enumerated data (subdomains, URLs, tech stack, favicon hash)       |
 
-**Recommendation:** Add: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
-```
-
-### Findings JSON (`.findings.json`)
-```json
-[
-  {
-    "title": "Missing Header: strict-transport-security",
-    "severity": "HIGH",
-    "description": "Response does not include `strict-transport-security`.",
-    "evidence": "Checked: https://example.com",
-    "recommendation": "Add: Strict-Transport-Security: max-age=31536000; ...",
-    "phase": "header_analysis",
-    "timestamp": "2025-01-15T14:32:01"
-  }
-]
-```
-
-The findings JSON is structured to import directly into a pentest findings database or be consumed by a report generator.
+The HTML report supports severity filtering and full-text search — drop it in a browser.
 
 ---
 
-## Diff Mode
+## Architecture
 
-Run two scans against the same target (e.g. before and after a remediation window) and compare:
+WebRecon organises checks into six phases, executed in order. Earlier-phase discoveries feed later phases via a thread-safe `DiscoveredState` store:
 
-```bash
-# First scan
-python3 web_app_pro.py -t example.com -o scan_jan
-
-# Second scan, diffed against the first
-python3 web_app_pro.py -t example.com -o scan_feb --diff scan_jan.findings.json
+```
+Phase 1 — Passive recon      (DNS, crt.sh, wayback, dorks, subdomains, favicon)
+                                         │
+                                         ▼ feeds URLs + params
+Phase 2 — Active recon       (nmap, wafw00f, vhost fuzzing)
+                                         │
+                                         ▼
+Phase 3 — Tech & content     (whatweb, playbooks, robots, katana, ffuf, arjun)
+                                         │
+                                         ▼ feeds URLs + params + endpoints
+Phase 4 — HTTP analysis      (headers, cors, host-header, crlf, oidc, jwt)
+                                         │
+                                         ▼
+Phase 5 — Vulnerability      (ssl, nuclei, js, graphql, lfi, redirect,
+                              ssrf, ssti, xxe, default-creds)
+                                         │
+                                         ▼
+Phase 6 — Infrastructure     (cloud buckets, screenshots)
 ```
 
-The final report section will list:
-- **New** findings not present in the previous scan
-- **Resolved** findings from the previous scan no longer present
-- **Unchanged** finding count
+Parameters harvested by the crawler and wayback mining feed SSRF / SSTI / CRLF / path-traversal / open-redirect / XXE probes, so those phases test the target's actual attack surface rather than a hardcoded generic parameter list.
 
 ---
 
-## Resuming Scans
+## Dependencies
 
-State is written to `<prefix>.state.json` after each phase completes. If a scan is interrupted (Ctrl+C, timeout, connection drop), re-run with the same output prefix and `--resume`:
+**Required (Python)** — `requests`, `colorama`, `tqdm`
 
-```bash
-python3 web_app_pro.py -t example.com -o myrecon --resume
-```
+**Optional** — each missing tool disables one feature and is logged, nothing else:
 
-Completed phases are skipped. Use `--fresh` to clear the state and restart from scratch.
+| Dependency    | Feature                                    |
+|---------------|--------------------------------------------|
+| `mmh3`        | Shodan-compatible favicon hash             |
+| `nmap`        | Port scanning                              |
+| `nuclei`      | Template-based vulnerability scanning      |
+| `katana`      | Crawling (feeds later phases)              |
+| `arjun`       | Hidden parameter discovery                 |
+| `subfinder`   | Subdomain enumeration                      |
+| `subjack`     | Subdomain takeover scan                    |
+| `ffuf`        | Content discovery / vhost fuzzing          |
+| `whatweb`     | Technology fingerprinting                  |
+| `webanalyze`  | Technology fingerprinting (alt)            |
+| `wafw00f`     | WAF detection                              |
+| `wpscan`      | WordPress deep-dive                        |
+| `droopescan`  | Drupal deep-dive                           |
+| `joomscan`    | Joomla deep-dive                           |
+| `nikto`       | Legacy vulnerability scanner               |
+| `testssl`     | SSL/TLS analysis                           |
+| `theHarvester`| Email harvesting                           |
+| `dnsrecon`    | DNS reconnaissance                         |
+| `gowitness`   | Screenshots                                |
 
 ---
 
-## Notes
+## Ethical use
 
-- **XXE probing** requires `--oob-url` pointing to an out-of-band callback host (interactsh, Burp Collaborator, etc.). Without it the phase is skipped cleanly.
-- **Google dork automation** requires a Google Custom Search API key and engine ID. Without them, dork URLs are generated and logged for manual review.
-- **`webanalyze`** is used in place of the deprecated `wappalyzer` CLI.
-- Nmap OS detection (`-O`) will prompt for `sudo` if not running as root.
-- Content discovery and Nikto prompt for confirmation in interactive mode. Use `--auto` to suppress all prompts.
-- Screenshots are saved to `./screenshots/` relative to the working directory.
+WebRecon is a penetration-testing tool. **Only run it against systems you own or have explicit, written authorisation to test.** Unauthorised access to computer systems is a criminal offence in most jurisdictions (Computer Misuse Act 1990, Computer Fraud and Abuse Act, etc.). The author accepts no responsibility for misuse.
 
 ---
 
-## Changelog
+## License
 
-### v2.0
-- Full rewrite in structured Python with dataclasses and typed interfaces
-- Parallelised phase execution (`ThreadPoolExecutor`)
-- Scope enforcement with CIDR and domain allowlists
-- Resumable scan state
-- Diff mode for before/after comparisons
-- Proxy and custom User-Agent support throughout all native HTTP calls
-- `shell=False` on all subprocess calls; input sanitisation
-- HTTP scheme auto-detection with HTTPS-first fallback
-- Structured `.findings.json` output with severity tags
-- New: certificate transparency (crt.sh), Wayback Machine URL mining
-- New: Google dork generation and optional API automation
-- New: email harvesting (theHarvester)
-- New: subdomain takeover fingerprint check (Python-native + subjack)
-- New: WAF/CDN fingerprinting (wafw00f + header analysis)
-- New: virtual host fuzzing (ffuf)
-- New: security header grading (6 OWASP headers)
-- New: cookie attribute auditing
-- New: CORS misconfiguration detection
-- New: OAuth/OIDC endpoint enumeration
-- New: JavaScript secret extraction (11 patterns)
-- New: GraphQL endpoint detection + introspection probe
-- New: path traversal probing
-- New: open redirect probing
-- New: XXE probing with OOB callback support
-- New: default credential testing (Tomcat, Jenkins, WordPress, Grafana)
-- New: cloud storage bucket enumeration (S3, GCS, Azure)
-- New: screenshots via gowitness
-- New: ASN and IPv6 enumeration
-- New: admin panel focused discovery wordlist
-- Replaced deprecated `wappalyzer` CLI with `webanalyze`
-- Expanded nmap port list to cover common non-standard web ports
-- Diff mode output in final report summary
+MIT
 
-### v1.0
-- Initial release — sequential scan phases wrapping nmap, nikto, whatweb, wappalyzer, subfinder, ffuf, testssl, dnsrecon, curl
+---
+
+## Credits
+
+WebRecon stands on the shoulders of:
+
+- [ProjectDiscovery](https://github.com/projectdiscovery) — nuclei, katana, subfinder, interactsh
+- [Arjun](https://github.com/s0md3v/Arjun) — s0md3v
+- [ffuf](https://github.com/ffuf/ffuf) — joohoi
+- [wpscan](https://wpscan.com) — WPScan team
+- [wafw00f](https://github.com/EnableSecurity/wafw00f) — EnableSecurity
+- [OWASP JoomScan](https://github.com/OWASP/joomscan), [droopescan](https://github.com/SamJoan/droopescan)
+- and the countless open-source security projects this framework orchestrates.
