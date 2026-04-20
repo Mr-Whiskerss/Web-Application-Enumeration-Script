@@ -421,16 +421,25 @@ class ScopeChecker:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class ScanState:
-    def __init__(self, state_file: str):
-        self._file = state_file
+    def __init__(self, state_file: str, target: str):
+        self._file   = state_file
+        self._target = target
         self._done: List[str] = []
-        self._start = datetime.now().isoformat()
+        self._start  = datetime.now().isoformat()
         if os.path.exists(state_file):
             try:
                 d = json.load(open(state_file))
+                saved_target = d.get("target")
+                # Target mismatch → auto-clear to prevent cross-target state collision
+                if saved_target and saved_target != target:
+                    print(f"{Fore.YELLOW}  [STATE] Previous state was for '{saved_target}' — "
+                          f"clearing (current target: '{target}')")
+                    os.remove(state_file)
+                    return
                 self._done  = d.get("done", [])
                 self._start = d.get("start", self._start)
-                print(f"{Fore.YELLOW}  [RESUME] Completed phases: {', '.join(self._done) or 'none'}")
+                if self._done:
+                    print(f"{Fore.YELLOW}  [RESUME] Completed phases: {', '.join(self._done)}")
             except Exception:
                 pass
 
@@ -440,7 +449,9 @@ class ScanState:
     def mark(self, phase: str):
         if phase not in self._done:
             self._done.append(phase)
-            json.dump({"done": self._done, "start": self._start,
+            json.dump({"target":  self._target,
+                       "done":    self._done,
+                       "start":   self._start,
                        "updated": datetime.now().isoformat()},
                       open(self._file, 'w'), indent=2)
 
@@ -2587,7 +2598,7 @@ def main():
     if not scope.check(target):
         print(f"{Fore.RED}  [!] {target} is OUT OF SCOPE — aborting."); sys.exit(1)
 
-    state = ScanState(state_f)
+    state = ScanState(state_f, target)
     if args.fresh:
         state.clear()
         print(f"{Fore.YELLOW}  [FRESH] State cleared.")
