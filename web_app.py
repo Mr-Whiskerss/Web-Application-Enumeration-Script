@@ -1,32 +1,43 @@
 #!/usr/bin/env python3
 """
-WebRecon v3.0 — Comprehensive Web Application Enumeration Tool
-Changelog vs v2:
-  Bug fixes:
-    - phase_default_creds success logic rewritten (was boolean spaghetti)
-    - _takeover_fingerprints now uses make_session (honours proxy/UA/timeout)
-    - ScopeChecker: IPv6 support + resolved-IP scope check for domain targets
-    - XXE: parameter-entity blind payload, SVG/SOAP content-type variants
-    - sanitise() loosened (allows host:port)
-    - Google dorks API count configurable
-  New features:
-    - Nuclei integration (CVE/misconfig templates)
-    - Authenticated scanning (--cookie, --header, --auth-check-url)
-    - Crawler (katana) → feeds URLs/params into later phases
-    - Parameter discovery (Arjun)
-    - SSRF probe (OOB-based, per-param injection)
-    - SSTI detection (Jinja2/Twig/FreeMarker/ERB)
-    - CRLF injection probe
-    - Host header injection probe
-    - JWT deep analysis (alg:none, weak secret, key confusion, kid injection)
-    - Tech-specific playbooks (WordPress/Drupal/Joomla/Spring/Tomcat/Laravel)
-    - Favicon hash (mmh3 for Shodan pivoting)
-    - Wayback parameter extraction
-    - HTML report output
-    - PentestDB integration (POST findings to self-hosted DB)
-    - Adaptive rate limiting (back off on 429/503)
-    - Webhook notifications (Discord/Slack compatible)
-    - Scan profiles: recon | active | full | stealth
+WebRecon — Comprehensive Web Application Reconnaissance & Enumeration
+
+A single-file Python framework that orchestrates passive OSINT, active
+reconnaissance, content discovery, vulnerability probing, and reporting
+for web-application penetration testing.
+
+Glues together the tools you already use (nuclei, katana, arjun, ffuf,
+nmap, wpscan, wafw00f, subfinder, etc.) and adds first-party checks
+covering the gaps those tools leave: JWT deep analysis, CORS, security
+headers, SSRF/SSTI/CRLF/host-header injection, cloud-metadata probing,
+default-credential testing, favicon-hash pivoting, and JS secret
+extraction.
+
+Features:
+  - Resumable scans (target-aware state file)
+  - Authenticated scanning (cookies, custom headers, session checks)
+  - Catch-all routing detection (eliminates FPs across SPAs/CDNs)
+  - Differential SSTI detection (control-payload + baseline diff)
+  - Strict GraphQL detection (JSON-shape validation)
+  - Scope enforcement (IPv4/IPv6 CIDRs + domains, resolved-IP checks)
+  - Adaptive rate limiting (exponential 429/503 backoff)
+  - Scan profiles: recon | active | full | stealth
+  - Output: Markdown, filterable HTML, JSON
+  - Diff mode against previous findings JSON
+  - Webhook notifications (Discord/Slack auto-detect)
+  - Tech-specific playbooks: WordPress / Drupal / Joomla / Laravel
+    / Spring / Tomcat / Jenkins / ASP.NET-IIS
+
+Usage:
+  ./web_app.py -t example.com --auto
+  ./web_app.py -t example.com -o engagement_2026 --proxy http://127.0.0.1:8080
+  ./web_app.py -t example.com --profile stealth --cookie "session=abc123"
+
+For full options:
+  ./web_app.py --help
+
+Project: https://github.com/Mr-Whiskerss/WebRecon
+License: MIT
 """
 
 import os
@@ -86,7 +97,7 @@ if _MISSING:
     sys.exit(1)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION        = "3.0.0"
+VERSION        = "3.1.0"
 DEFAULT_UA     = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/120.0.0.0 Safari/537.36")
@@ -159,6 +170,13 @@ class ScanConfig:
     no_intrusive:    bool           = False
     nuclei_severity: str            = "medium,high,critical"
     html_report:     bool           = True
+    # Tool timeouts
+    whatweb_timeout: int            = 120
+    arjun_timeout:   int            = 1200
+    # Catch-all baseline (filled in at scan start)
+    catchall_active: bool           = False
+    catchall_size:   int            = 0
+    catchall_body:   str            = ""
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ADAPTIVE RATE-LIMITED SESSION
@@ -570,9 +588,14 @@ def revalidate_session(cfg: ScanConfig, out: str) -> bool:
 # TOOL HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
 
+_MISSING_TOOLS: Set[str] = set()
+_MISSING_TOOLS_LOCK = threading.Lock()
+
 def _tool_ok(name: str, output_file: str) -> bool:
     if shutil.which(name):
         return True
+    with _MISSING_TOOLS_LOCK:
+        _MISSING_TOOLS.add(name)
     msg = f"{name} not installed — skipping"
     print(f"  {Fore.YELLOW}⚠ {msg}")
     _log(output_file, f"> ⚠️ {msg}")
@@ -637,6 +660,62 @@ def diff_findings(current: List[Finding], prev_file: str) -> Dict:
         }
     except Exception:
         return {}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CATCH-ALL DETECTION
+# Many SPAs / CDNs / WAFs return the homepage (or a generic 200) for *any*
+# unknown path. Without detecting this, every content/well-known/graphql probe
+# becomes a false positive. We probe a random unlikely path once at scan start
+# and store the response signature on cfg, then check before any 200-based
+# inference.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def detect_catchall(cfg: "ScanConfig", out: str):
+    """Probe a random unlikely path. If the server returns 200, mark catch-all
+    on cfg with the baseline body+size for later comparison."""
+    sess = make_session(cfg)
+    canary = f"/webrecon-canary-{hashlib.md5(os.urandom(8)).hexdigest()[:12]}"
+    try:
+        r = sess.get(f"{cfg.base_url}{canary}", timeout=cfg.timeout,
+                     allow_redirects=False)
+        if r.status_code in (200, 201, 202):
+            cfg.catchall_active = True
+            cfg.catchall_size   = len(r.content)
+            cfg.catchall_body   = r.text[:5000]
+            _log(out, f"\n## Catch-All Detected\n"
+                      f"- Probe URL: `{cfg.base_url}{canary}`\n"
+                      f"- HTTP {r.status_code} ({len(r.content)} bytes)\n"
+                      f"- Server returns 200 for unknown paths. "
+                      f"Findings dependent on '200 = exists' will be filtered.")
+            print(f"  {Fore.YELLOW}⚠ Catch-all routing detected — "
+                  f"{r.status_code} for unknown paths "
+                  f"({len(r.content)} bytes baseline)")
+        else:
+            _log(out, f"\n## Catch-All Probe\n"
+                      f"- Unknown path returned HTTP {r.status_code} (good — "
+                      f"server distinguishes valid paths)")
+    except Exception as e:
+        _log(out, f"> Catch-all probe failed: {e}")
+
+
+def looks_like_catchall(cfg: "ScanConfig", response_text: str,
+                         response_bytes: int) -> bool:
+    """Return True if a 200 response matches the catch-all baseline.
+    Used by routing-dependent phases to suppress false positives."""
+    if not cfg.catchall_active:
+        return False
+    # Size match within 10% (allows for tiny dynamic content variation)
+    size_diff_pct = (abs(response_bytes - cfg.catchall_size) /
+                     max(cfg.catchall_size, 1)) * 100
+    if size_diff_pct < 10:
+        return True
+    # Or substantial body overlap (first 2 KB of HTML usually identical)
+    if cfg.catchall_body and response_text:
+        head_baseline = cfg.catchall_body[:2000]
+        head_actual   = response_text[:2000]
+        if head_baseline == head_actual:
+            return True
+    return False
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PHASE 1 — PASSIVE RECONNAISSANCE
@@ -1078,10 +1157,27 @@ def phase_tech_detection(target: str, cfg: ScanConfig, out: str, st: ScanState) 
     section("Technology Detection", out)
     detected = {}
 
+    # WhatWeb dumps every plugin including HTTP-header recognisers like
+    # 'access-control-allow-methods', 'x-frame-options', 'country', 'ip',
+    # 'cookies', 'redirectlocation', 'uncommonheaders' etc. These are not
+    # technologies — they're meta-info — and they pollute playbook matching.
+    # Filter against a denylist of known-noisy plugin names.
+    JUNK_PLUGINS = {
+        'access-control-allow-methods', 'access-control-allow-origin',
+        'access-control-allow-headers', 'access-control-allow-credentials',
+        'country', 'ip', 'redirectlocation', 'uncommonheaders',
+        'cookies', 'frame', 'script', 'title', 'httponly',
+        'strict-transport-security', 'x-frame-options', 'x-ua-compatible',
+        'x-content-type-options', 'content-security-policy',
+        'permissions-policy', 'referrer-policy', 'pingback',
+        'meta-author', 'meta-generator', 'meta-keywords', 'passwordfield',
+        'email', 'header-hash', 'html5', 'via-proxy', 'x-powered-by',
+    }
+
     if _tool_ok("whatweb", out):
         stdout, _, _ = run_cmd(["whatweb", "-v", "-a", "3",
                                 "--log-json=/tmp/whatweb.json", cfg.base_url],
-                               "WhatWeb", out, cfg, 60)
+                               "WhatWeb", out, cfg, cfg.whatweb_timeout)
         # Parse whatweb JSON output
         try:
             if os.path.exists("/tmp/whatweb.json"):
@@ -1090,7 +1186,10 @@ def phase_tech_detection(target: str, cfg: ScanConfig, out: str, st: ScanState) 
                         try:
                             entry = json.loads(line)
                             for plug in entry.get('plugins', {}):
-                                detected[plug.lower()] = entry['plugins'][plug]
+                                pl = plug.lower()
+                                if pl in JUNK_PLUGINS:
+                                    continue
+                                detected[pl] = entry['plugins'][plug]
                         except Exception:
                             continue
         except Exception:
@@ -1099,15 +1198,38 @@ def phase_tech_detection(target: str, cfg: ScanConfig, out: str, st: ScanState) 
         if stdout:
             for tech in ('wordpress', 'drupal', 'joomla', 'tomcat', 'jenkins',
                          'spring', 'laravel', 'django', 'flask', 'express',
-                         'asp.net', 'nginx', 'apache', 'iis'):
+                         'asp.net', 'asp_net', 'nginx', 'apache', 'iis',
+                         'nodejs', 'php', 'ruby', 'rails'):
                 if tech in stdout.lower():
                     detected.setdefault(tech, True)
 
     if _tool_ok("webanalyze", out):
         run_cmd(["webanalyze", "-host", cfg.base_url], "webanalyze", out, cfg, 60)
 
+    # Header-based tech detection (always runs, doesn't need any tool)
+    try:
+        sess = make_session(cfg)
+        r = sess.get(cfg.base_url, timeout=cfg.timeout)
+        for hdr_key, hdr_val in r.headers.items():
+            hk = hdr_key.lower()
+            hv = hdr_val.lower()
+            if hk == 'server':
+                for tech in ('iis', 'nginx', 'apache', 'tomcat', 'jetty',
+                             'kestrel', 'gunicorn', 'uvicorn'):
+                    if tech in hv:
+                        detected[tech] = hdr_val
+            if hk == 'x-powered-by':
+                for tech in ('asp.net', 'php', 'express', 'next.js'):
+                    if tech in hv:
+                        detected[tech.replace('.', '_')] = hdr_val
+            if hk == 'x-aspnet-version' or hk == 'x-aspnetmvc-version':
+                detected['asp_net'] = hdr_val
+    except Exception:
+        pass
+
     if detected:
-        _log(out, f"\n## Detected Technologies\n```\n{json.dumps(list(detected.keys()), indent=2)}\n```")
+        _log(out, f"\n## Detected Technologies (filtered)\n"
+                  f"```\n{json.dumps(list(detected.keys()), indent=2)}\n```")
     st.mark(phase)
     return detected
 
@@ -1221,6 +1343,75 @@ def phase_tech_playbooks(target: str, cfg: ScanConfig, out: str,
             except Exception:
                 continue
 
+    # ASP.NET / IIS — common admin/debug endpoints
+    aspnet_indicators = ('asp.net', 'asp_net', 'iis', 'kestrel')
+    if any(any(ind in t for ind in aspnet_indicators) for t in detected_lower):
+        sess = make_session(cfg)
+        # (path, severity, recommendation)
+        ASPNET_PROBES = [
+            ("/Trace.axd",          Severity.HIGH,
+             "Disable trace.axd in production (web.config: <trace enabled='false'/>)."),
+            ("/elmah.axd",          Severity.HIGH,
+             "Restrict elmah.axd to authenticated admin users (allowRemoteAccess='false' or auth)."),
+            ("/elmah.axd/csv",      Severity.HIGH,
+             "Restrict elmah.axd CSV export to authenticated admin users."),
+            ("/elmah.axd/download", Severity.HIGH,
+             "Restrict elmah.axd download to authenticated admin users."),
+            ("/web.config",         Severity.CRITICAL,
+             "Web.config must NEVER be downloadable. Verify static-content handler config."),
+            ("/web.config.bak",     Severity.CRITICAL,
+             "Remove backup configuration file."),
+            ("/_vti_bin/_vti_aut/author.dll", Severity.MEDIUM,
+             "Disable FrontPage Server Extensions if not in use."),
+            ("/_vti_pvt/service.pwd",  Severity.HIGH,
+             "Remove FrontPage password file from webroot."),
+            ("/aspnet_client/",     Severity.LOW,
+             "Verify directory listing is disabled on /aspnet_client/."),
+            ("/App_Data/",          Severity.MEDIUM,
+             "App_Data should not be web-accessible. Verify request filtering."),
+            ("/bin/",               Severity.MEDIUM,
+             "/bin should be inaccessible. Verify request filtering rules."),
+            ("/App_Code/",          Severity.MEDIUM,
+             "App_Code should not be web-accessible."),
+            ("/Global.asax",        Severity.LOW,
+             "Verify Global.asax cannot be downloaded as source."),
+            ("/Default.aspx?aspxerrorpath=/", Severity.LOW,
+             "Custom error pages should not leak stack traces."),
+        ]
+        for path, sev, rec in ASPNET_PROBES:
+            try:
+                r = sess.get(f"{cfg.base_url}{path}", timeout=cfg.timeout,
+                             allow_redirects=False)
+                if r.status_code != 200:
+                    continue
+                # Catch-all suppression
+                if looks_like_catchall(cfg, r.text, len(r.content)):
+                    continue
+                # Confirmation strings per endpoint to avoid generic 200s
+                body_l = r.text.lower()
+                confirms = {
+                    "/trace.axd":     "application trace" in body_l or "request details" in body_l,
+                    "/elmah.axd":     "error log" in body_l or "elmah" in body_l,
+                    "/web.config":    "<configuration" in body_l or "<system.web" in body_l,
+                    "/web.config.bak":"<configuration" in body_l or "<system.web" in body_l,
+                    "/_vti_pvt/service.pwd": ":" in r.text and "\n" in r.text,
+                    "/global.asax":   "application_start" in body_l or "<%@" in body_l,
+                }
+                # For paths not in confirms, accept any 200 (directory listings etc.)
+                key = path.lower().split('?')[0]
+                if key in confirms and not confirms[key]:
+                    continue
+
+                add_finding(Finding(
+                    title=f"ASP.NET/IIS Endpoint Exposed: {path}",
+                    severity=sev,
+                    description=f"ASP.NET/IIS sensitive endpoint reachable: {path}",
+                    evidence=f"GET {cfg.base_url}{path} → HTTP 200\n{r.text[:300]}",
+                    recommendation=rec,
+                    phase=phase), out, cfg)
+            except Exception:
+                continue
+
     st.mark(phase)
 
 
@@ -1234,8 +1425,17 @@ def phase_robots_sitemap(target: str, tt: TargetType, cfg: ScanConfig,
                  "/.well-known/security.txt", "/.well-known/change-password"]:
         try:
             r = sess.get(f"{cfg.base_url}{path}", timeout=cfg.timeout)
+            # Skip catch-all hits — server is returning the homepage, not the file
+            if r.status_code == 200 and looks_like_catchall(cfg, r.text, len(r.content)):
+                _log(out, f"\n### `{path}` — HTTP 200 *(catch-all — actual file does not exist)*")
+                continue
             _log(out, f"\n### `{path}` — HTTP {r.status_code}\n```\n{r.text[:2000]}\n```")
             if r.status_code == 200 and path == "/robots.txt":
+                # Verify it actually looks like robots.txt before parsing
+                if not re.search(r'(?i)^\s*(user-agent|disallow|allow|sitemap)\s*:',
+                                  r.text, re.M):
+                    _log(out, f"> ⚠️ /robots.txt response doesn't look like robots.txt — skipping parse.")
+                    continue
                 disallowed = [l.split(':', 1)[1].strip() for l in r.text.splitlines()
                               if l.lower().startswith('disallow:') and
                               len(l.split(':', 1)) > 1 and l.split(':', 1)[1].strip() not in ('', '/')]
@@ -1247,8 +1447,8 @@ def phase_robots_sitemap(target: str, tt: TargetType, cfg: ScanConfig,
                         evidence='\n'.join(disallowed[:20]),
                         recommendation="Review disallowed paths for sensitive functionality.",
                         phase=phase), out, cfg)
-                # Feed into discovered endpoints for later fuzzing
-                DISCOVERED.add_urls([f"{cfg.base_url}{p}" for p in disallowed if p.startswith('/')])
+                    # Feed into discovered endpoints for later fuzzing
+                    DISCOVERED.add_urls([f"{cfg.base_url}{p}" for p in disallowed if p.startswith('/')])
         except Exception as e:
             _log(out, f"> {path}: {e}")
     st.mark(phase)
@@ -1376,7 +1576,7 @@ def phase_param_discovery(target: str, cfg: ScanConfig, out: str, st: ScanState)
            "-t", str(min(cfg.threads * 2, 10)), "--stable"]
     if cfg.cookie:
         cmd += ["--headers", f"Cookie: {cfg.cookie}"]
-    run_cmd(cmd, "arjun parameter discovery", out, cfg, 600)
+    run_cmd(cmd, "arjun parameter discovery", out, cfg, cfg.arjun_timeout)
 
     if os.path.exists(output_file):
         try:
@@ -1623,19 +1823,28 @@ def phase_oauth_oidc(target: str, cfg: ScanConfig, out: str, st: ScanState):
     for path in paths:
         try:
             r = sess.get(f"{cfg.base_url}{path}", timeout=cfg.timeout)
-            if r.status_code == 200:
-                _log(out, f"\n### Found: `{path}`\n```json\n{r.text[:1000]}\n```")
-                try:
-                    data = r.json()
-                    add_finding(Finding(
-                        title=f"OAuth/OIDC Endpoint: {path}",
-                        severity=Severity.INFO,
-                        description=f"Scopes: {data.get('scopes_supported',[])} | Grants: {data.get('grant_types_supported',[])}",
-                        evidence=r.text[:800],
-                        recommendation="Disable implicit flow if unused. Review exposed scopes.",
-                        phase=phase), out, cfg)
-                except Exception:
-                    pass
+            if r.status_code != 200:
+                continue
+            # Suppress catch-all hits
+            if looks_like_catchall(cfg, r.text, len(r.content)):
+                _log(out, f"\n### `{path}` — HTTP 200 *(catch-all — skipped)*")
+                continue
+            # Require valid JSON for OIDC config endpoints; tolerate non-JSON
+            # for the rest (some servers redirect /oauth/token to a login page).
+            ctype = r.headers.get('Content-Type', '').lower()
+            try:
+                data = r.json()
+            except Exception:
+                _log(out, f"\n### `{path}` — HTTP 200 (non-JSON, content-type: {ctype}) — skipped")
+                continue
+            _log(out, f"\n### Found: `{path}`\n```json\n{r.text[:1000]}\n```")
+            add_finding(Finding(
+                title=f"OAuth/OIDC Endpoint: {path}",
+                severity=Severity.INFO,
+                description=f"Scopes: {data.get('scopes_supported',[])} | Grants: {data.get('grant_types_supported',[])}",
+                evidence=r.text[:800],
+                recommendation="Disable implicit flow if unused. Review exposed scopes.",
+                phase=phase), out, cfg)
         except Exception:
             continue
     st.mark(phase)
@@ -1911,6 +2120,9 @@ def phase_js_analysis(target: str, cfg: ScanConfig, out: str, st: ScanState):
 
 
 def phase_graphql(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    """Detect GraphQL endpoints. Strict checks: response must be JSON
+    (Content-Type AND parseable) with top-level data/errors key. This
+    eliminates HTML-catch-all false positives."""
     phase = "graphql"
     if st.done(phase): return
     section("GraphQL Endpoint Detection", out)
@@ -1922,14 +2134,46 @@ def phase_graphql(target: str, cfg: ScanConfig, out: str, st: ScanState):
         try:
             r = sess.post(url, json={"query": "{__schema{queryType{name}}}"},
                           timeout=cfg.timeout)
-            if r.status_code in (200, 201) and ('__schema' in r.text or 'data' in r.text):
-                add_finding(Finding(
-                    title=f"GraphQL Endpoint: {path}",
-                    severity=Severity.MEDIUM,
-                    description=f"GraphQL found at {url}. Introspection may be enabled.",
-                    evidence=f"POST {url} → HTTP {r.status_code}\n{r.text[:400]}",
-                    recommendation="Disable introspection in production. Add depth/complexity limits and auth.",
-                    phase=phase), out, cfg)
+            if r.status_code not in (200, 201, 400, 403):
+                continue
+            # Catch-all suppression
+            if r.status_code in (200, 201) and looks_like_catchall(cfg, r.text, len(r.content)):
+                _log(out, f"- `{path}` HTTP {r.status_code} (catch-all — skipped)")
+                continue
+            # Require JSON content-type
+            ctype = r.headers.get('Content-Type', '').lower()
+            if 'json' not in ctype:
+                _log(out, f"- `{path}` HTTP {r.status_code} (non-JSON: {ctype}) — skipped")
+                continue
+            # Must parse as JSON
+            try:
+                data = r.json()
+            except Exception:
+                _log(out, f"- `{path}` HTTP {r.status_code} (JSON parse failed) — skipped")
+                continue
+            # Must have GraphQL-shaped response: top-level 'data' or 'errors'
+            if not isinstance(data, dict) or not ({'data', 'errors'} & set(data.keys())):
+                _log(out, f"- `{path}` HTTP {r.status_code} (JSON but no data/errors key) — skipped")
+                continue
+
+            # Now we're confident it's GraphQL — assess introspection
+            introspection_works = (
+                'data' in data and
+                isinstance(data.get('data'), dict) and
+                '__schema' in str(data.get('data', {}))
+            )
+            sev = Severity.MEDIUM if introspection_works else Severity.LOW
+            desc = (f"GraphQL endpoint at {url}. "
+                    f"{'Introspection enabled.' if introspection_works else 'Introspection appears disabled.'}")
+            add_finding(Finding(
+                title=f"GraphQL Endpoint: {path}",
+                severity=sev,
+                description=desc,
+                evidence=f"POST {url} → HTTP {r.status_code}\nContent-Type: {ctype}\n{r.text[:600]}",
+                recommendation=("Disable introspection in production. Add depth/complexity limits and auth."
+                                if introspection_works else
+                                "Verify introspection is disabled in production. Add auth + rate-limiting."),
+                phase=phase), out, cfg)
         except Exception:
             continue
     st.mark(phase)
@@ -2089,21 +2333,35 @@ def phase_ssrf(target: str, cfg: ScanConfig, out: str, st: ScanState):
 
 
 def phase_ssti(target: str, cfg: ScanConfig, out: str, st: ScanState):
-    """Server-side template injection detection across discovered parameters."""
+    """Server-side template injection detection across discovered parameters.
+
+    Uses a DIFFERENTIAL approach to eliminate false positives:
+      1. Baseline:        param=__webrecon_canary__   → record response
+      2. Probe payload:   param={{31337*1337}}        → expect '41897569'
+      3. Control payload: param={{31337*1338}}        → expect '41928906'
+    Both numbers are 8-digit primes-ish that don't appear in real HTML by
+    chance. Fires a finding ONLY if:
+      - probe response contains the probe result (e.g. '41897569')
+      - probe response does NOT contain the control result (eliminates pages
+        that just dump everything)
+      - control response contains the control result OR neither result (i.e.
+        results aren't being statically returned regardless of input)
+      - probe response differs from baseline (eliminates static catch-all)
+    """
     phase = "ssti"
     if st.done(phase): return
     section("SSTI Probe", out)
-
     sess = make_session(cfg)
-    # Each payload evaluates to a unique deterministic value
-    payloads = [
-        ("{{7*7}}",     "49",  "Jinja2/Twig"),
-        ("${7*7}",      "49",  "FreeMarker/JSP-EL"),
-        ("<%= 7*7 %>",  "49",  "ERB/EJS"),
-        ("#{7*7}",      "49",  "Ruby/Thymeleaf"),
-        ("{{7*'7'}}",   "7777777", "Jinja2"),
-        ("${{7*7}}",    "49",  "Handlebars-like"),
-        ("@(7*7)",      "49",  "Razor"),
+
+    # Each entry: (probe_payload, probe_result, control_payload, control_result, engine)
+    # Numbers chosen to be distinctive and not collide with timestamps, IDs etc.
+    PROBES = [
+        ("{{31337*1337}}",     "41897569", "{{31337*1338}}",     "41928906", "Jinja2/Twig"),
+        ("${31337*1337}",      "41897569", "${31337*1338}",      "41928906", "FreeMarker/JSP-EL"),
+        ("<%= 31337*1337 %>",  "41897569", "<%= 31337*1338 %>",  "41928906", "ERB/EJS"),
+        ("#{31337*1337}",      "41897569", "#{31337*1338}",      "41928906", "Ruby/Thymeleaf"),
+        ("${{31337*1337}}",    "41897569", "${{31337*1338}}",    "41928906", "Handlebars-like"),
+        ("@(31337*1337)",      "41897569", "@(31337*1338)",      "41928906", "Razor"),
     ]
 
     common = ['name', 'search', 'query', 'q', 'msg', 'message', 'greeting',
@@ -2112,21 +2370,66 @@ def phase_ssti(target: str, cfg: ScanConfig, out: str, st: ScanState):
         discovered = list(DISCOVERED.params)
     params = list(set(common + discovered))[:20]
 
+    canary_value = "__webrecon_ssti_canary__"
+
     for param in params:
-        for pl, expected, engine in payloads:
+        # Step 1: baseline with a canary value
+        try:
+            base = sess.get(f"{cfg.base_url}?{param}={canary_value}",
+                            timeout=cfg.timeout)
+            baseline_text = base.text
+        except Exception:
+            continue
+
+        for probe_pl, probe_res, control_pl, control_res, engine in PROBES:
             try:
-                r = sess.get(f"{cfg.base_url}?{param}={pl}",
-                             timeout=cfg.timeout)
-                # Check for evaluated result AND absence of raw payload
-                if expected in r.text and pl not in r.text[:10000]:
-                    add_finding(Finding(
-                        title=f"SSTI ({engine}) via `{param}`",
-                        severity=Severity.CRITICAL,
-                        description=f"Parameter `{param}` appears to evaluate template expressions ({engine}).",
-                        evidence=f"URL: {cfg.base_url}?{param}={pl}\nPayload: {pl}\nExpected: {expected}\nReflected in response.",
-                        recommendation="Never pass user input to template engines as template code. Use parameterised rendering (context data only).",
-                        phase=phase), out, cfg)
-                    break
+                # Step 2: the actual SSTI probe
+                pr = sess.get(f"{cfg.base_url}?{param}={probe_pl}",
+                              timeout=cfg.timeout)
+                probe_text = pr.text
+
+                # Quick fail: probe result not in response → no SSTI
+                if probe_res not in probe_text:
+                    continue
+
+                # Quick fail: probe result was already in baseline → coincidence
+                if probe_res in baseline_text:
+                    continue
+
+                # Step 3: differential check with control payload
+                cr = sess.get(f"{cfg.base_url}?{param}={control_pl}",
+                              timeout=cfg.timeout)
+                control_text = cr.text
+
+                # If probe response also contains the control result, the page
+                # is reflecting both / dumping data. Not real SSTI.
+                if control_res in probe_text:
+                    continue
+
+                # Control payload should produce its own result (templated)
+                # OR the page should differ from baseline
+                control_evaluated = control_res in control_text
+                differs_from_baseline = abs(len(probe_text) - len(baseline_text)) > 8
+
+                if not (control_evaluated or differs_from_baseline):
+                    continue
+
+                add_finding(Finding(
+                    title=f"SSTI ({engine}) via `{param}`",
+                    severity=Severity.CRITICAL,
+                    description=(f"Parameter `{param}` evaluates template expressions ({engine}). "
+                                 f"Differential check confirmed: probe '{probe_pl}' produced "
+                                 f"'{probe_res}', control '{control_pl}' produced "
+                                 f"'{control_res}'."),
+                    evidence=(f"Param: {param}\n"
+                              f"Probe payload:   {probe_pl} → '{probe_res}' present\n"
+                              f"Control payload: {control_pl} → '{control_res}' "
+                              f"{'present' if control_evaluated else 'absent'}\n"
+                              f"Baseline contained probe result: {probe_res in baseline_text}\n"
+                              f"URL: {cfg.base_url}?{param}={probe_pl}"),
+                    recommendation="Never pass user input to template engines as template code. Use parameterised rendering (context data only).",
+                    phase=phase), out, cfg)
+                break
             except Exception:
                 continue
     st.mark(phase)
@@ -2556,6 +2859,10 @@ Examples:
     p.add_argument("--nuclei-severity",     default="medium,high,critical",
                    help="Nuclei severity filter (default: medium,high,critical)")
     p.add_argument("--no-html",             action="store_true", help="Skip HTML report generation")
+    p.add_argument("--whatweb-timeout",      type=int, default=120,
+                   help="WhatWeb timeout in seconds (default: 120)")
+    p.add_argument("--arjun-timeout",        type=int, default=1200,
+                   help="Arjun timeout in seconds (default: 1200)")
     return p.parse_args()
 
 
@@ -2645,6 +2952,8 @@ def main():
         no_intrusive=args.no_intrusive,
         nuclei_severity=args.nuclei_severity,
         html_report=not args.no_html,
+        whatweb_timeout=args.whatweb_timeout,
+        arjun_timeout=args.arjun_timeout,
     )
     cfg = _apply_profile(args, cfg)
 
@@ -2682,6 +2991,12 @@ def main():
     is_recon_only = cfg.profile == ScanProfile.RECON
     is_at_least_active = cfg.profile in (ScanProfile.ACTIVE, ScanProfile.FULL, ScanProfile.STEALTH)
     is_full = cfg.profile in (ScanProfile.FULL, ScanProfile.STEALTH)
+
+    # Detect catch-all routing once — used by routing-dependent phases to
+    # suppress false positives (graphql, robots/sitemap, oauth_oidc, playbooks).
+    if not is_recon_only:
+        print(f"\n{Fore.CYAN}  Probing for catch-all routing…")
+        detect_catchall(cfg, out)
 
     detected_tech: Dict = {}
 
@@ -2806,6 +3121,44 @@ def main():
               f"{Fore.CYAN}{counts.get(Severity.INFO,0)} INFO")
         print(f"{Fore.CYAN}  Report:   {out}")
         print(f"{Fore.CYAN}  Findings: {findings}")
+
+        # Tool-availability summary (mark coverage gaps)
+        with _MISSING_TOOLS_LOCK:
+            missing = sorted(_MISSING_TOOLS)
+        if missing:
+            install_hints = {
+                "katana":     "go install github.com/projectdiscovery/katana/cmd/katana@latest",
+                "nuclei":     "go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+                "subfinder":  "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+                "arjun":      "pip install arjun",
+                "wpscan":     "gem install wpscan",
+                "droopescan": "pip install droopescan",
+                "joomscan":   "github.com/OWASP/joomscan",
+                "testssl":    "apt install testssl.sh   (or git clone drwetter/testssl.sh)",
+                "gowitness":  "go install github.com/sensepost/gowitness@latest",
+                "webanalyze": "go install github.com/rverton/webanalyze/cmd/webanalyze@latest",
+                "subjack":    "go install github.com/haccer/subjack@latest",
+                "wafw00f":    "pip install wafw00f",
+                "dnsrecon":   "apt install dnsrecon",
+                "theHarvester": "apt install theharvester",
+                "nikto":      "apt install nikto",
+                "ffuf":       "apt install ffuf",
+                "whatweb":    "apt install whatweb",
+                "nmap":       "apt install nmap",
+            }
+            print(f"\n{Fore.YELLOW}  ⚠ Coverage gap — these tools were not installed and their phases skipped:")
+            _log(out, "\n\n## Tool Availability Summary\n\n"
+                       "The following tools were NOT installed during this scan. "
+                       "Their phases were skipped, so coverage may be incomplete:\n")
+            for t in missing:
+                hint = install_hints.get(t, "")
+                line = f"  • {t}" + (f"   →  {hint}" if hint else "")
+                print(f"{Fore.YELLOW}{line}")
+                _log(out, f"- **{t}**" + (f" — install: `{hint}`" if hint else ""))
+        else:
+            print(f"\n{Fore.GREEN}  ✓ All optional tools were available.")
+            _log(out, "\n\n## Tool Availability Summary\n\nAll optional tools were installed during this scan.")
+
         print(f"{Fore.MAGENTA}{'═'*60}\n")
 
 
