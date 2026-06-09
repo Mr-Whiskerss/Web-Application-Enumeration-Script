@@ -36,8 +36,8 @@ Usage:
 For full options:
   ./web_app.py --help
 
-Project: https://github.com/Mr-Whiskerss/WebRecon
-License: MIT
+Project: https://github.com/Mr-Whiskerss/Web-Application-Enumeration-Script
+License: GPL-3.0
 """
 
 import os
@@ -79,11 +79,6 @@ except ImportError:
         RED=GREEN=YELLOW=BLUE=CYAN=MAGENTA=WHITE=""
     class Style:
         RESET_ALL=BRIGHT=""
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    _MISSING.append("tqdm")
 
 # Optional deps — degrade gracefully
 try:
@@ -261,11 +256,19 @@ DISCOVERED = DiscoveredState()
 
 _findings: List[Finding] = []
 _findings_lock = threading.Lock()
+_finding_keys: Set[str] = set()   # dedup on (title | severity | evidence-hash)
 _SEV_ORDER = {Severity.INFO:0, Severity.LOW:1, Severity.MEDIUM:2,
               Severity.HIGH:3, Severity.CRITICAL:4}
 
 def add_finding(f: Finding, output_file: str, cfg: Optional[ScanConfig] = None):
+    # Suppress exact duplicates — crawled params feed several phases, so the
+    # same issue can otherwise be emitted (and webhook-pushed) multiple times.
+    key = (f"{f.title}|{f.severity.value}|"
+           f"{hashlib.md5((f.evidence or '').encode()).hexdigest()}")
     with _findings_lock:
+        if key in _finding_keys:
+            return
+        _finding_keys.add(key)
         _findings.append(f)
     color = {
         Severity.INFO:     Fore.CYAN,
@@ -411,8 +414,9 @@ class ScopeChecker:
         # IP literal check
         try:
             addr = ipaddress.ip_address(target)
-            return any(addr in net for net in self.cidrs
-                       if isinstance(net, type(ipaddress.ip_network(str(net)))) or True)
+            # addr in net is False (not an error) across mismatched IP versions,
+            # so a plain membership test is both correct and readable.
+            return any(addr in net for net in self.cidrs)
         except ValueError:
             pass
         # Domain match
@@ -1245,7 +1249,6 @@ def phase_tech_playbooks(target: str, cfg: ScanConfig, out: str,
 
     section("Tech-Specific Playbooks", out)
     detected_lower = {k.lower() for k in detected.keys()}
-    host = target.split(':')[0]
 
     # WordPress
     if any('wordpress' in t for t in detected_lower):
@@ -1434,7 +1437,7 @@ def phase_robots_sitemap(target: str, tt: TargetType, cfg: ScanConfig,
                 # Verify it actually looks like robots.txt before parsing
                 if not re.search(r'(?i)^\s*(user-agent|disallow|allow|sitemap)\s*:',
                                   r.text, re.M):
-                    _log(out, f"> ⚠️ /robots.txt response doesn't look like robots.txt — skipping parse.")
+                    _log(out, "> ⚠️ /robots.txt response doesn't look like robots.txt — skipping parse.")
                     continue
                 disallowed = [l.split(':', 1)[1].strip() for l in r.text.splitlines()
                               if l.lower().startswith('disallow:') and
@@ -1761,7 +1764,7 @@ def phase_host_header(target: str, cfg: ScanConfig, out: str, st: ScanState):
                 add_finding(Finding(
                     title=f"Host Header Injection: {list(headers.keys())[-1]}",
                     severity=Severity.HIGH,
-                    description=f"Host header canary reflected in response/redirect — indicates possible cache poisoning or password-reset poisoning.",
+                    description="Host header canary reflected in response/redirect — indicates possible cache poisoning or password-reset poisoning.",
                     evidence=f"Injected headers: {headers}\nLocation: {loc}\nBody snippet: {r.text[:200]}",
                     recommendation="Validate Host/X-Forwarded-Host headers against an allowlist. Don't trust untrusted headers for URL generation.",
                     phase=phase), out, cfg)
@@ -2496,7 +2499,7 @@ def phase_xxe(target: str, cfg: ScanConfig, out: str, st: ScanState):
         title="XXE Probes Sent (classic + blind + SOAP + SVG)",
         severity=Severity.INFO,
         description=f"XXE payloads sent across {len(paths)} endpoints and {len(tests)} content-type variants. Monitor {cfg.oob_url} for DNS/HTTP callbacks.",
-        evidence=f"Markers: xxe-classic, xxe-blind-dtd, xxe-soap, xxe-svg",
+        evidence="Markers: xxe-classic, xxe-blind-dtd, xxe-soap, xxe-svg",
         recommendation="Disable external entity & external DTD processing in all XML parsers (defusedxml / feature flags).",
         phase=phase), out, cfg)
     st.mark(phase)
@@ -2625,7 +2628,7 @@ def phase_screenshots(target: str, cfg: ScanConfig, out: str, st: ScanState):
     if st.done(phase): return
     section("Screenshots (gowitness)", out)
     if _tool_ok("gowitness", out):
-        os.makedirs(f"./screenshots", exist_ok=True)
+        os.makedirs("./screenshots", exist_ok=True)
         run_cmd(["gowitness", "single", "--url", cfg.base_url,
                  "--screenshot-path", "./screenshots"],
                 "gowitness", out, cfg, 60)
@@ -2804,7 +2807,7 @@ def write_html_report(cfg: ScanConfig, html_path: str,
 
 def parse_args():
     p = ArgumentParser(
-        description="WebRecon v3.0 — Comprehensive Web Application Enumeration",
+        description=f"WebRecon v{VERSION} — Comprehensive Web Application Enumeration",
         formatter_class=RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -2989,7 +2992,6 @@ def main():
 
     # Shortcut: is profile restrictive?
     is_recon_only = cfg.profile == ScanProfile.RECON
-    is_at_least_active = cfg.profile in (ScanProfile.ACTIVE, ScanProfile.FULL, ScanProfile.STEALTH)
     is_full = cfg.profile in (ScanProfile.FULL, ScanProfile.STEALTH)
 
     # Detect catch-all routing once — used by routing-dependent phases to
