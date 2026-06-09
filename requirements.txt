@@ -1,2 +1,8 @@
+# Core (required)
+requests
+urllib3
 colorama
-tqdm
+
+# Optional — enables one extra feature each, safe to omit:
+#   mmh3   → Shodan-compatible favicon hash (falls back to SHA-256)
+#   arjun  → hidden-parameter discovery (also installable as a system tool)
