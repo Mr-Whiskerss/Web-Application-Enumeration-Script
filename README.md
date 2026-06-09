@@ -89,11 +89,14 @@ It's a glue layer around the tools you already use (nuclei, katana, arjun, ffuf,
 
 ```bash
 # Clone
-git clone https://github.com/Mr-Whiskerss/WebRecon.git
-cd WebRecon
+git clone https://github.com/Mr-Whiskerss/Web-Application-Enumeration-Script.git
+cd Web-Application-Enumeration-Script
 
-# Python dependencies
-pip install requests colorama tqdm mmh3 arjun
+# Python dependencies (core)
+pip install -r requirements.txt          # requests, urllib3, colorama
+
+# Optional Python deps (one extra feature each)
+pip install mmh3 arjun                    # favicon hash + hidden-param discovery
 
 # Go tools (install what you plan to use)
 go install github.com/projectdiscovery/katana/cmd/katana@latest
@@ -320,7 +323,7 @@ Parameters harvested by the crawler and wayback mining feed SSRF / SSTI / CRLF /
 
 ## Dependencies
 
-**Required (Python)** — `requests`, `colorama`, `tqdm`
+**Required (Python)** — `requests`, `urllib3`, `colorama`
 
 **Optional** — each missing tool disables one feature and is logged, nothing else:
 
@@ -356,7 +359,7 @@ WebRecon is a penetration-testing tool. **Only run it against systems you own or
 
 ## License
 
-MIT
+GPL-3.0 — see [LICENSE](LICENSE).
 
 ---
 
