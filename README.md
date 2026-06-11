@@ -177,6 +177,9 @@ WebRecon degrades gracefully — any missing external tool causes its phase to l
 
 # Low-and-slow
 ./web_app.py -t example.com --profile stealth --auto
+
+# Batch scan a file of targets (one per line)
+./web_app.py -iL targets.txt --auto
 ```
 
 ---
@@ -250,6 +253,30 @@ Cookies and headers are threaded through to **katana**, **arjun**, **ffuf**, and
   --no-intrusive
 ```
 
+**Batch scanning — a file of targets**
+```bash
+cat > targets.txt <<'EOF'
+# one target per line — domains, IPs, or host:port
+app.client.corp
+10.0.0.10
+api.client.corp:8443
+EOF
+
+./web_app.py -iL targets.txt --auto
+```
+Each target is scanned in turn and gets its **own** output set, prefixed with the
+sanitised target name (e.g. `webrecon_10.0.0.10.md`, `webrecon_app.client.corp.report.html`),
+so nothing overwrites. State, findings, discovered URLs/params and dedup are reset
+between targets — results never bleed across the batch — and a combined severity
+summary is printed at the end. Blank lines and `#` comments (including inline) are
+ignored; invalid or out-of-scope entries are skipped with a warning rather than
+aborting the run. Use `-o <prefix>` to change the per-target prefix, and combine with
+`--scope-file` to hard-enforce scope across the whole list.
+
+> Batch input expects one host per line. CIDR ranges (`10.0.0.0/24`) and IPv6 literals
+> aren't expanded by the validator — pre-expand ranges first, e.g.
+> `nmap -sL -n 10.0.0.0/24 | awk '/report for/{print $NF}' > targets.txt`.
+
 **Scope-locked engagement**
 ```bash
 cat > scope.txt <<'EOF'
@@ -281,6 +308,7 @@ Run `./web_app.py --help` for the full list.
 |----------------------------|-------------------------------------------------------------|
 | `-t, --target`             | Target (domain / IP / host:port)                            |
 | `-o, --output`             | Output prefix (default `webrecon`)                          |
+| `-iL, --target-list`       | File of targets, one per line — batch mode                  |
 | `--auto`                   | Skip all interactive prompts                                |
 | `--profile`                | `recon` / `active` / `full` / `stealth`                     |
 | `--proxy`                  | HTTP / SOCKS proxy                                          |
@@ -315,6 +343,10 @@ A single scan produces:
 | `<prefix>.report.html`        | Self-contained filterable HTML report (no server required)  |
 | `<prefix>.findings.json`      | Structured findings (JSON list of `Finding` objects)        |
 | `<prefix>.state.json`         | Resume state (phase checkpoints)                            |
+
+In **batch mode** (`-iL`) the prefix becomes `<prefix>_<target>`, so every target
+produces its own independent `.md` / `.report.html` / `.findings.json` / `.state.json`
+set and `--resume` works per target.
 
 Findings are categorised:
 
