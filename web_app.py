@@ -10,8 +10,12 @@ Glues together the tools you already use (nuclei, katana, arjun, ffuf,
 nmap, wpscan, wafw00f, subfinder, etc.) and adds first-party checks
 covering the gaps those tools leave: JWT deep analysis, CORS, security
 headers, SSRF/SSTI/CRLF/host-header injection, cloud-metadata probing,
-default-credential testing, favicon-hash pivoting, and JS secret
-extraction.
+default-credential testing, favicon-hash pivoting, JS secret extraction,
+differential SQLi (error/boolean/time), reflected-XSS context analysis,
+HTTP request smuggling (CL.TE/TE.CL timing), verb tampering, 401/403
+bypass, deep CSP analysis, OpenAPI/Swagger/WSDL schema mining, VCS/source
+exposure (.git/.svn/.env/backups), WebSocket discovery, prototype
+pollution, and DNS posture (SPF/DMARC/DNSSEC/CAA/AXFR).
 
 Features:
   - Resumable scans (target-aware state file)
@@ -27,6 +31,8 @@ Features:
   - Webhook notifications (Discord/Slack auto-detect)
   - Tech-specific playbooks: WordPress / Drupal / Joomla / Laravel
     / Spring / Tomcat / Jenkins / ASP.NET-IIS
+  - API-aware: parses OpenAPI/Swagger/WSDL into the discovery state so
+    SQLi/XSS/SSRF/traversal phases test the real API surface
 
 Usage:
   ./web_app.py -t example.com --auto
@@ -92,7 +98,7 @@ if _MISSING:
     sys.exit(1)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION        = "3.1.0"
+VERSION        = "3.2.0"
 DEFAULT_UA     = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/120.0.0.0 Safari/537.36")
@@ -1655,12 +1661,20 @@ def phase_header_analysis(target: str, cfg: ScanConfig, out: str, st: ScanState)
                     phase=phase), out, cfg)
 
         # Cookie audit
-        set_cookie_raw = r.headers.get('Set-Cookie', '').lower()
         for cookie in r.cookies:
             issues = []
-            if not cookie.secure:           issues.append("Missing Secure flag")
-            if 'httponly' not in set_cookie_raw: issues.append("Missing HttpOnly")
-            if 'samesite' not in set_cookie_raw: issues.append("Missing SameSite")
+            if not cookie.secure:
+                issues.append("Missing Secure flag")
+            # Inspect this cookie's own attributes rather than the merged header
+            if not (cookie.has_nonstandard_attr('HttpOnly') or
+                    cookie.has_nonstandard_attr('httponly')):
+                issues.append("Missing HttpOnly")
+            samesite = (cookie.get_nonstandard_attr('SameSite') or
+                        cookie.get_nonstandard_attr('samesite') or '')
+            if not samesite:
+                issues.append("Missing SameSite")
+            elif samesite.lower() == 'none' and not cookie.secure:
+                issues.append("SameSite=None without Secure")
             if issues:
                 add_finding(Finding(
                     title=f"Cookie Issues: {cookie.name}",
@@ -2635,6 +2649,1056 @@ def phase_screenshots(target: str, cfg: ScanConfig, out: str, st: ScanState):
     st.mark(phase)
 
 # ═════════════════════════════════════════════════════════════════════════════
+# PHASE 1+ — DNS SECURITY POSTURE (SPF / DMARC / DNSSEC / CAA / AXFR)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _dig(args: List[str], timeout: int = 10) -> str:
+    """Thin dig wrapper. Returns stdout ('' on any failure)."""
+    if not shutil.which("dig"):
+        return ""
+    try:
+        r = subprocess.run(["dig", "+short"] + args,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=timeout)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def phase_dns_security(target: str, tt: TargetType, cfg: ScanConfig,
+                       out: str, st: ScanState):
+    """Passive DNS hardening review: SPF, DMARC, DNSSEC, CAA, plus an
+    AXFR zone-transfer attempt against each authoritative nameserver."""
+    phase = "dns_security"
+    if st.done(phase) or tt != TargetType.DOMAIN:
+        return
+    section("DNS Security Posture (SPF / DMARC / DNSSEC / CAA / AXFR)", out)
+    if not shutil.which("dig"):
+        _log(out, "> dig not installed — skipping DNS security checks.")
+        with _MISSING_TOOLS_LOCK:
+            _MISSING_TOOLS.add("dig")
+        st.mark(phase); return
+
+    host = target.split(':')[0]
+
+    # SPF
+    spf = [l for l in _dig(["TXT", host]).splitlines() if 'v=spf1' in l.lower()]
+    if not spf:
+        add_finding(Finding(
+            title="Missing SPF Record",
+            severity=Severity.LOW,
+            description="No SPF (v=spf1) TXT record found — eases email spoofing of this domain.",
+            evidence=f"dig +short TXT {host} → no v=spf1",
+            recommendation="Publish an SPF record ending in `-all` (hard fail) once senders are enumerated.",
+            phase=phase), out, cfg)
+    else:
+        joined = ' '.join(spf).lower()
+        _log(out, f"- SPF: `{spf[0][:300]}`")
+        if '+all' in joined or ('~all' not in joined and '-all' not in joined):
+            add_finding(Finding(
+                title="Weak SPF Policy",
+                severity=Severity.LOW,
+                description="SPF record uses `+all`/`?all` or omits an `all` mechanism — does not restrict senders.",
+                evidence=spf[0][:300],
+                recommendation="Terminate the SPF record with `-all` (or at minimum `~all`).",
+                phase=phase), out, cfg)
+
+    # DMARC
+    dmarc = [l for l in _dig(["TXT", f"_dmarc.{host}"]).splitlines() if 'v=dmarc1' in l.lower()]
+    if not dmarc:
+        add_finding(Finding(
+            title="Missing DMARC Record",
+            severity=Severity.MEDIUM,
+            description="No DMARC record at _dmarc — receivers have no policy for SPF/DKIM failures, enabling spoofing.",
+            evidence=f"dig +short TXT _dmarc.{host} → empty",
+            recommendation="Publish a DMARC record, starting at `p=none` for monitoring then moving to `p=quarantine`/`p=reject`.",
+            phase=phase), out, cfg)
+    else:
+        rec = dmarc[0].lower()
+        _log(out, f"- DMARC: `{dmarc[0][:300]}`")
+        if 'p=none' in rec:
+            add_finding(Finding(
+                title="DMARC Policy Not Enforced (p=none)",
+                severity=Severity.LOW,
+                description="DMARC is published but set to `p=none` — failures are only monitored, not blocked.",
+                evidence=dmarc[0][:300],
+                recommendation="Progress the policy to `p=quarantine` then `p=reject` after monitoring reports.",
+                phase=phase), out, cfg)
+
+    # DNSSEC
+    dnskey = _dig(["DNSKEY", host])
+    if not dnskey:
+        add_finding(Finding(
+            title="DNSSEC Not Enabled",
+            severity=Severity.INFO,
+            description="No DNSKEY records — the zone is not DNSSEC-signed and is exposed to DNS spoofing/cache poisoning.",
+            evidence=f"dig +short DNSKEY {host} → empty",
+            recommendation="Enable DNSSEC signing at the registrar/DNS provider where feasible.",
+            phase=phase), out, cfg)
+    else:
+        _log(out, "- DNSSEC: DNSKEY present (zone signed)")
+
+    # CAA
+    caa = _dig(["CAA", host])
+    if not caa:
+        add_finding(Finding(
+            title="No CAA Record",
+            severity=Severity.INFO,
+            description="No CAA record — any CA may issue certificates for this domain.",
+            evidence=f"dig +short CAA {host} → empty",
+            recommendation="Publish a CAA record restricting issuance to approved CAs.",
+            phase=phase), out, cfg)
+    else:
+        _log(out, f"- CAA: `{caa[:200]}`")
+
+    # Zone transfer (AXFR) against each NS
+    nameservers = [n.rstrip('.') for n in _dig(["NS", host]).splitlines() if n.strip()]
+    _log(out, f"- Nameservers: {', '.join(nameservers) or 'none resolved'}")
+    for ns in nameservers[:6]:
+        try:
+            r = subprocess.run(["dig", f"@{ns}", host, "AXFR", "+time=5", "+tries=1"],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, timeout=15)
+            body = r.stdout
+            # A real transfer dumps many records; failures say "Transfer failed"/"connection timed out"
+            if "Transfer failed" not in body and "connection timed out" not in body \
+               and body.count("IN") >= 5 and "SOA" in body:
+                add_finding(Finding(
+                    title=f"DNS Zone Transfer Allowed: {ns}",
+                    severity=Severity.HIGH,
+                    description=f"Nameserver {ns} permits AXFR zone transfer, leaking the full DNS zone for {host}.",
+                    evidence=f"dig @{ns} {host} AXFR returned {body.count(chr(10))} lines\n{body[:600]}",
+                    recommendation="Restrict AXFR to authorised secondaries only (allow-transfer ACL).",
+                    phase=phase), out, cfg)
+                # Mine transferred A/CNAME hostnames into DISCOVERED context
+                hosts = re.findall(r'^(\S+?)\.\s+\d+\s+IN\s+(?:A|AAAA|CNAME)', body, re.M)
+                if hosts:
+                    _log(out, f"  → {len(hosts)} hostnames recovered from zone transfer")
+        except Exception:
+            continue
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 3+ — API SCHEMA DISCOVERY (OpenAPI / Swagger / WSDL)
+# Force-multiplier: parses schemas into DISCOVERED endpoints+params so that
+# every downstream injection phase (SQLi/XSS/SSRF/traversal) gets real surface.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def phase_api_schema(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    phase = "api_schema"
+    if st.done(phase): return
+    section("API Schema Discovery (OpenAPI / Swagger / WSDL)", out)
+    sess = make_session(cfg)
+
+    schema_paths = [
+        "/swagger.json", "/swagger/v1/swagger.json", "/swagger/v2/swagger.json",
+        "/openapi.json", "/openapi.yaml", "/api-docs", "/api/api-docs",
+        "/v2/api-docs", "/v3/api-docs", "/api/swagger.json", "/api/v1/swagger.json",
+        "/swagger-ui.html", "/swagger/index.html", "/api/openapi.json",
+        "/.well-known/openapi.json", "/docs/swagger.json", "/redoc",
+        "/api/docs", "/graphql/schema.json",
+    ]
+
+    found_specs = []
+    for path in schema_paths:
+        url = f"{cfg.base_url}{path}"
+        try:
+            r = sess.get(url, timeout=cfg.timeout, allow_redirects=True)
+            if r.status_code != 200 or len(r.content) < 30:
+                continue
+            if looks_like_catchall(cfg, r.text, len(r.content)):
+                continue
+            ctype = r.headers.get('Content-Type', '').lower()
+            # Swagger UI HTML page (not the spec itself)
+            if 'html' in ctype and ('swagger-ui' in r.text.lower() or 'redoc' in r.text.lower()):
+                add_finding(Finding(
+                    title=f"API Documentation UI Exposed: {path}",
+                    severity=Severity.LOW,
+                    description=f"Interactive API docs reachable at {path} — exposes the full API surface to anonymous users.",
+                    evidence=f"GET {url} → HTTP 200 (Swagger UI / ReDoc)",
+                    recommendation="Restrict API documentation UIs to authenticated/internal users in production.",
+                    phase=phase), out, cfg)
+                continue
+            # Try to parse a JSON spec
+            try:
+                spec = r.json()
+            except Exception:
+                continue
+            if not isinstance(spec, dict):
+                continue
+            is_openapi = 'openapi' in spec or 'swagger' in spec or 'paths' in spec
+            if not is_openapi:
+                continue
+            found_specs.append(path)
+
+            paths_obj = spec.get('paths', {}) or {}
+            base_path = spec.get('basePath', '') or ''
+            servers = spec.get('servers', [])
+            server_prefix = ''
+            if servers and isinstance(servers, list) and isinstance(servers[0], dict):
+                try:
+                    server_prefix = urlparse(servers[0].get('url', '')).path or ''
+                except Exception:
+                    server_prefix = ''
+            prefix = server_prefix or base_path
+
+            endpoints, params = set(), set()
+            for ep, methods in paths_obj.items():
+                full_ep = (prefix.rstrip('/') + '/' + ep.lstrip('/')) if prefix else ep
+                endpoints.add(full_ep)
+                if isinstance(methods, dict):
+                    for verb, op in methods.items():
+                        if not isinstance(op, dict):
+                            continue
+                        for prm in op.get('parameters', []) or []:
+                            if isinstance(prm, dict) and prm.get('name'):
+                                params.add(prm['name'])
+                # Path templating {id} → param name
+                for m in re.findall(r'\{([^}]+)\}', ep):
+                    params.add(m)
+
+            # Feed into shared discovery state for downstream phases
+            DISCOVERED.add_urls([urljoin(cfg.base_url, e) for e in endpoints if e.startswith('/')])
+            DISCOVERED.add_params(params)
+
+            add_finding(Finding(
+                title=f"OpenAPI/Swagger Spec Exposed: {path}",
+                severity=Severity.MEDIUM,
+                description=(f"Machine-readable API spec at {path} reveals "
+                             f"{len(endpoints)} endpoints and {len(params)} parameters. "
+                             f"All have been fed into downstream injection testing."),
+                evidence=(f"GET {url} → HTTP 200\nTitle: "
+                          f"{spec.get('info', {}).get('title', '?')}\n"
+                          f"Endpoints (sample): " + ', '.join(sorted(endpoints)[:15])),
+                recommendation="Confirm the spec is intended to be public. Ensure documented endpoints enforce authn/authz.",
+                phase=phase), out, cfg)
+            print(f"  {Fore.GREEN}✓ API spec {path}: {len(endpoints)} endpoints, {len(params)} params → DISCOVERED")
+        except Exception:
+            continue
+
+    # WSDL (SOAP) discovery
+    for path in ("?wsdl", "/service?wsdl", "/services?wsdl", "/soap?wsdl"):
+        try:
+            url = f"{cfg.base_url}{path}"
+            r = sess.get(url, timeout=cfg.timeout)
+            tl = r.text.lower()
+            if r.status_code == 200 and ('<wsdl:definitions' in tl or ('<definitions' in tl and 'soap' in tl)):
+                if looks_like_catchall(cfg, r.text, len(r.content)):
+                    continue
+                ops = re.findall(r'<(?:wsdl:)?operation\s+name="([^"]+)"', r.text)
+                add_finding(Finding(
+                    title=f"SOAP WSDL Exposed: {path}",
+                    severity=Severity.MEDIUM,
+                    description=f"A WSDL service definition is reachable at {path} ({len(set(ops))} operations).",
+                    evidence=f"GET {url} → HTTP 200\nOperations: {', '.join(sorted(set(ops))[:15])}",
+                    recommendation="Restrict WSDL exposure; ensure each SOAP operation enforces authentication.",
+                    phase=phase), out, cfg)
+        except Exception:
+            continue
+
+    if not found_specs:
+        _log(out, "> No machine-readable API schema found at common locations.")
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 3+ — SOURCE / VCS / CONFIG EXPOSURE
+# ═════════════════════════════════════════════════════════════════════════════
+
+def phase_source_exposure(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    """Detect exposed VCS metadata, dotfiles, configs and backup/swap files.
+    Each hit requires a content signature to avoid catch-all/200 false positives."""
+    phase = "source_exposure"
+    if st.done(phase): return
+    section("Source / VCS / Config Exposure", out)
+    sess = make_session(cfg)
+
+    # (path, severity, signature_predicate(text)->bool, recommendation)
+    CHECKS = [
+        ("/.git/HEAD", Severity.HIGH,
+         lambda t: t.strip().startswith("ref:") or re.match(r'^[0-9a-f]{40}$', t.strip()),
+         "Remove the .git directory from the web root; serve only built assets."),
+        ("/.git/config", Severity.HIGH,
+         lambda t: "[core]" in t or "[remote" in t,
+         "Remove .git from production. The repo (incl. history/secrets) may be fully recoverable."),
+        ("/.svn/entries", Severity.HIGH,
+         lambda t: t.strip().startswith(("8", "9", "10", "11", "12")) or "svn" in t.lower(),
+         "Remove .svn metadata from the web root."),
+        ("/.svn/wc.db", Severity.HIGH,
+         lambda t: t[:15].startswith("SQLite format"),
+         "Remove .svn metadata; the working-copy DB exposes file paths."),
+        ("/.hg/requires", Severity.MEDIUM,
+         lambda t: "revlog" in t or "store" in t,
+         "Remove Mercurial metadata from the web root."),
+        ("/.DS_Store", Severity.LOW,
+         lambda t: "Bud1" in t[:32],
+         "Remove .DS_Store files; they leak directory/file listings."),
+        ("/.env", Severity.CRITICAL,
+         lambda t: re.search(r'(?im)^[A-Z0-9_]+=', t) is not None,
+         "Remove .env from the web root immediately and rotate any exposed secrets."),
+        ("/.env.local", Severity.CRITICAL,
+         lambda t: re.search(r'(?im)^[A-Z0-9_]+=', t) is not None,
+         "Remove environment files from the web root and rotate exposed secrets."),
+        ("/.htpasswd", Severity.HIGH,
+         lambda t: ":" in t and ("$apr1$" in t or "$2y$" in t or re.search(r'^\w+:\S+$', t, re.M)),
+         "Move .htpasswd outside the web root; rotate affected credentials."),
+        ("/.bash_history", Severity.MEDIUM,
+         lambda t: bool(t.strip()) and "\n" in t,
+         "Remove shell history files from web-accessible directories."),
+        ("/composer.json", Severity.LOW,
+         lambda t: '"require"' in t or '"name"' in t,
+         "Confirm exposure is intended; dependency versions aid targeted attacks."),
+        ("/package.json", Severity.LOW,
+         lambda t: '"dependencies"' in t or '"name"' in t,
+         "Confirm exposure is intended; dependency versions aid targeted attacks."),
+        ("/Dockerfile", Severity.LOW,
+         lambda t: re.search(r'(?im)^(FROM|RUN|COPY|ENV)\s', t) is not None,
+         "Avoid serving build files; they reveal infrastructure detail."),
+        ("/docker-compose.yml", Severity.MEDIUM,
+         lambda t: "services:" in t or "image:" in t,
+         "Remove compose files from the web root; they often embed credentials."),
+        ("/server-status", Severity.MEDIUM,
+         lambda t: "Apache Server Status" in t,
+         "Restrict mod_status (/server-status) to localhost/trusted IPs."),
+        ("/server-info", Severity.MEDIUM,
+         lambda t: "Apache Server Information" in t,
+         "Disable or restrict mod_info (/server-info)."),
+        ("/phpinfo.php", Severity.HIGH,
+         lambda t: "phpinfo()" in t or "PHP Version" in t,
+         "Remove phpinfo() pages from production."),
+    ]
+
+    # Backup/swap variants generated for the index document
+    backup_targets = [
+        "/index.php~", "/index.php.bak", "/index.php.old", "/index.php.save",
+        "/.index.php.swp", "/index.bak", "/index.html.bak", "/web.config.bak",
+        "/backup.zip", "/backup.tar.gz", "/backup.sql", "/db.sql", "/dump.sql",
+        "/database.sql", "/www.zip", "/site.zip", "/wwwroot.zip", "/.config.php.swp",
+    ]
+
+    for path, sev, sig, rec in CHECKS:
+        try:
+            r = sess.get(f"{cfg.base_url}{path}", timeout=cfg.timeout, allow_redirects=False)
+            if r.status_code != 200 or len(r.content) < 3:
+                continue
+            if looks_like_catchall(cfg, r.text, len(r.content)):
+                continue
+            if not sig(r.text):
+                continue
+            add_finding(Finding(
+                title=f"Exposed File: {path}",
+                severity=sev,
+                description=f"`{path}` is publicly accessible and matched its content signature.",
+                evidence=f"GET {cfg.base_url}{path} → HTTP 200 ({len(r.content)} bytes)\n{r.text[:300]}",
+                recommendation=rec,
+                phase=phase), out, cfg)
+        except Exception:
+            continue
+
+    # Backup/swap files — confirmation = non-HTML or sizeable body that isn't catch-all
+    for path in backup_targets:
+        try:
+            r = sess.get(f"{cfg.base_url}{path}", timeout=cfg.timeout, allow_redirects=False)
+            if r.status_code != 200 or len(r.content) < 16:
+                continue
+            if looks_like_catchall(cfg, r.text, len(r.content)):
+                continue
+            ctype = r.headers.get('Content-Type', '').lower()
+            looks_archive = any(s in ctype for s in ('zip', 'octet-stream', 'gzip', 'sql', 'x-tar'))
+            looks_source = path.endswith(('~', '.bak', '.old', '.save', '.swp')) and 'html' not in ctype
+            if looks_archive or looks_source or '<?php' in r.text[:200]:
+                add_finding(Finding(
+                    title=f"Backup / Swap File Exposed: {path}",
+                    severity=Severity.HIGH,
+                    description=f"A backup or editor swap file is downloadable at {path}, potentially leaking source or data.",
+                    evidence=f"GET {cfg.base_url}{path} → HTTP 200\nContent-Type: {ctype}\nSize: {len(r.content)} bytes",
+                    recommendation="Remove backup/swap files from the web root and block these extensions at the server.",
+                    phase=phase), out, cfg)
+        except Exception:
+            continue
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 4+ — HTTP METHODS & VERB TAMPERING
+# ═════════════════════════════════════════════════════════════════════════════
+
+def phase_http_methods(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    """Enumerate allowed methods; test TRACE (XST), dangerous verbs, and
+    verb-based auth bypass. A live PUT upload test runs only when intrusive
+    checks are permitted, and any uploaded canary is deleted afterwards."""
+    phase = "http_methods"
+    if st.done(phase): return
+    section("HTTP Methods & Verb Tampering", out)
+    sess = make_session(cfg)
+
+    # OPTIONS — advertised methods
+    try:
+        r = sess.options(cfg.base_url, timeout=cfg.timeout)
+        allow = r.headers.get('Allow', '') or r.headers.get('Access-Control-Allow-Methods', '')
+        if allow:
+            _log(out, f"- Allowed methods (OPTIONS): `{allow}`")
+            risky = [m for m in ('PUT', 'DELETE', 'PATCH', 'TRACE', 'CONNECT')
+                     if m in allow.upper()]
+            if risky:
+                add_finding(Finding(
+                    title=f"Potentially Dangerous HTTP Methods Advertised: {', '.join(risky)}",
+                    severity=Severity.LOW,
+                    description=f"The server advertises {', '.join(risky)} via OPTIONS.",
+                    evidence=f"Allow: {allow}",
+                    recommendation="Disable unused methods (PUT/DELETE/TRACE/CONNECT) at the web server/WAF.",
+                    phase=phase), out, cfg)
+    except Exception as e:
+        _log(out, f"> OPTIONS failed: {e}")
+
+    # TRACE → Cross-Site Tracing (XST)
+    try:
+        r = sess.request("TRACE", cfg.base_url, timeout=cfg.timeout)
+        if r.status_code == 200 and 'TRACE' in r.text[:200].upper():
+            add_finding(Finding(
+                title="HTTP TRACE Enabled (XST)",
+                severity=Severity.MEDIUM,
+                description="The server responds to TRACE and echoes the request — enabling Cross-Site Tracing.",
+                evidence=f"TRACE {cfg.base_url} → HTTP 200, request echoed\n{r.text[:200]}",
+                recommendation="Disable the TRACE method (TraceEnable Off / equivalent).",
+                phase=phase), out, cfg)
+    except Exception:
+        pass
+
+    # Live PUT upload test (intrusive only)
+    if not cfg.no_intrusive:
+        canary = f"webrecon-{hashlib.md5(os.urandom(8)).hexdigest()[:10]}.txt"
+        marker = f"webrecon-put-{hashlib.md5(os.urandom(8)).hexdigest()[:8]}"
+        put_url = f"{cfg.base_url}/{canary}"
+        try:
+            pr = sess.put(put_url, data=marker, timeout=cfg.timeout)
+            if pr.status_code in (200, 201, 204):
+                vr = sess.get(put_url, timeout=cfg.timeout)
+                if vr.status_code == 200 and marker in vr.text:
+                    add_finding(Finding(
+                        title="Arbitrary File Upload via HTTP PUT",
+                        severity=Severity.CRITICAL,
+                        description="An anonymous PUT request created a retrievable file on the server.",
+                        evidence=f"PUT {put_url} → HTTP {pr.status_code}; GET confirmed marker present.",
+                        recommendation="Disable PUT (and WebDAV) or require strict authentication/authorisation.",
+                        phase=phase), out, cfg)
+                # Clean up regardless
+                try: sess.delete(put_url, timeout=cfg.timeout)
+                except Exception: pass
+        except Exception:
+            pass
+
+    # Verb-based auth bypass against protected paths
+    protected = ["/admin", "/admin/", "/manager/html", "/api/admin",
+                 "/dashboard", "/private", "/internal"]
+    with DISCOVERED._lock:
+        protected += [e for e in DISCOVERED.endpoints
+                      if any(k in e.lower() for k in ('admin', 'manage', 'internal', 'private'))][:10]
+    for path in list(dict.fromkeys(protected)):
+        url = f"{cfg.base_url}{path}"
+        try:
+            base = sess.get(url, timeout=cfg.timeout, allow_redirects=False)
+        except Exception:
+            continue
+        if base.status_code not in (401, 403):
+            continue
+        # Try alternative verbs that some frameworks fail to gate
+        for verb in ("HEAD", "POST", "PUT", "PATCH", "TRACK", "FOOBAR"):
+            try:
+                vr = sess.request(verb, url, timeout=cfg.timeout, allow_redirects=False)
+                if vr.status_code in (200, 201, 202, 204):
+                    add_finding(Finding(
+                        title=f"Verb-Based Auth Bypass: {verb} {path}",
+                        severity=Severity.HIGH,
+                        description=f"`{path}` returns {base.status_code} for GET but {vr.status_code} for {verb} — access control is method-dependent.",
+                        evidence=f"GET {url} → {base.status_code}\n{verb} {url} → {vr.status_code}",
+                        recommendation="Enforce authorisation on all HTTP methods, not just GET/POST. Deny unknown verbs.",
+                        phase=phase), out, cfg)
+                    break
+            except Exception:
+                continue
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 4+ — 401/403 BYPASS (path-normalisation + header overrides)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def phase_403_bypass(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    phase = "forbidden_bypass"
+    if st.done(phase): return
+    section("401 / 403 Access-Control Bypass", out)
+    sess = make_session(cfg)
+
+    candidates = ["/admin", "/admin/", "/manager/html", "/api/admin", "/dashboard",
+                  "/private", "/internal", "/.git/config", "/server-status"]
+    with DISCOVERED._lock:
+        candidates += list(DISCOVERED.endpoints)[:15]
+
+    def _payloads(path: str):
+        p = path.rstrip('/')
+        # (label, url_suffix, extra_headers)
+        return [
+            ("trailing-slash",     path + "/", {}),
+            ("trailing-dot",       p + "/.",   {}),
+            ("double-slash",       "/" + path.lstrip('/'), {}),  # leading // handled by server
+            ("path-%2e",           p + "/%2e/", {}),
+            ("semicolon",          p + "/..;/", {}),
+            ("encoded-slash",      p + "%2f", {}),
+            ("uppercase",          p.upper() if p.lower() != p.upper() else p, {}),
+            ("x-original-url",     "/",  {"X-Original-URL": path}),
+            ("x-rewrite-url",      "/",  {"X-Rewrite-URL": path}),
+            ("x-forwarded-for",    path, {"X-Forwarded-For": "127.0.0.1"}),
+            ("x-custom-ip-auth",   path, {"X-Custom-IP-Authorization": "127.0.0.1"}),
+            ("x-originating-ip",   path, {"X-Originating-IP": "127.0.0.1"}),
+            ("referer-self",       path, {"Referer": cfg.base_url + path}),
+        ]
+
+    seen = set()
+    for path in list(dict.fromkeys(candidates)):
+        if not path.startswith('/') or path in seen:
+            continue
+        seen.add(path)
+        try:
+            base = sess.get(f"{cfg.base_url}{path}", timeout=cfg.timeout, allow_redirects=False)
+        except Exception:
+            continue
+        if base.status_code not in (401, 403):
+            continue
+        base_len = len(base.content)
+        for label, suffix, hdrs in _payloads(path):
+            try:
+                r = sess.get(f"{cfg.base_url}{suffix}", headers=hdrs or None,
+                             timeout=cfg.timeout, allow_redirects=False)
+                # Bypass = now 2xx AND content differs meaningfully from the 403 page
+                if r.status_code in (200, 201, 202, 206) and abs(len(r.content) - base_len) > 32:
+                    add_finding(Finding(
+                        title=f"403/401 Bypass ({label}): {path}",
+                        severity=Severity.HIGH,
+                        description=f"`{path}` returns {base.status_code} normally but {r.status_code} using the `{label}` technique.",
+                        evidence=(f"Baseline: GET {path} → {base.status_code} ({base_len} bytes)\n"
+                                  f"Bypass:   {label} → {r.status_code} ({len(r.content)} bytes)\n"
+                                  f"Headers:  {hdrs}"),
+                        recommendation="Normalise paths before authorisation; do not trust X-Original-URL/X-Rewrite-URL or client IP headers for access decisions.",
+                        phase=phase), out, cfg)
+                    break
+            except Exception:
+                continue
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 4+ — CONTENT-SECURITY-POLICY DEEP ANALYSIS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def phase_csp_analysis(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    phase = "csp_analysis"
+    if st.done(phase): return
+    section("Content-Security-Policy Analysis", out)
+    sess = make_session(cfg)
+    try:
+        r = sess.get(cfg.base_url, timeout=cfg.timeout, allow_redirects=True)
+    except Exception as e:
+        _log(out, f"> CSP fetch failed: {e}")
+        st.mark(phase); return
+
+    csp = r.headers.get('Content-Security-Policy', '')
+    if not csp:
+        # Meta-tag CSP
+        m = re.search(r'<meta[^>]+http-equiv=["\']content-security-policy["\'][^>]+content=["\']([^"\']+)',
+                      r.text, re.I)
+        if m:
+            csp = m.group(1)
+    if not csp:
+        _log(out, "> No CSP present (already reported by header phase).")
+        st.mark(phase); return
+
+    _log(out, f"- CSP: `{csp[:500]}`")
+    directives = {}
+    for part in csp.split(';'):
+        part = part.strip()
+        if not part:
+            continue
+        toks = part.split()
+        directives[toks[0].lower()] = [t.lower() for t in toks[1:]]
+
+    script_src = directives.get('script-src', directives.get('default-src', []))
+    issues = []
+    if "'unsafe-inline'" in script_src and "'strict-dynamic'" not in script_src \
+       and not any(s.startswith("'nonce-") or s.startswith("'sha") for s in script_src):
+        issues.append(("'unsafe-inline' in script-src without nonce/hash/strict-dynamic", Severity.MEDIUM))
+    if "'unsafe-eval'" in script_src:
+        issues.append(("'unsafe-eval' permitted in script-src", Severity.MEDIUM))
+    if '*' in script_src:
+        issues.append(("Wildcard '*' source in script-src/default-src", Severity.MEDIUM))
+    if any(s in ('data:', 'http:', 'https:') for s in script_src):
+        issues.append(("Overly-broad scheme source (data:/http:/https:) in script-src", Severity.LOW))
+    if 'object-src' not in directives and 'default-src' not in directives:
+        issues.append(("Missing object-src (recommend object-src 'none')", Severity.LOW))
+    if 'base-uri' not in directives:
+        issues.append(("Missing base-uri (allows <base> tag injection)", Severity.LOW))
+    if 'frame-ancestors' not in directives:
+        issues.append(("Missing frame-ancestors (clickjacking control)", Severity.LOW))
+
+    for desc, sev in issues:
+        add_finding(Finding(
+            title=f"Weak CSP: {desc.split('(')[0].strip()}",
+            severity=sev,
+            description=f"Content-Security-Policy weakness: {desc}.",
+            evidence=f"CSP: {csp[:400]}",
+            recommendation="Tighten the CSP: prefer nonces/hashes + 'strict-dynamic', set object-src 'none', base-uri 'self', and frame-ancestors.",
+            phase=phase), out, cfg)
+    if not issues:
+        _log(out, "- CSP present and no obvious weaknesses in script-src/object-src/base-uri/frame-ancestors.")
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 5+ — REFLECTED INPUT / XSS CONTEXT PROBE  (safe, non-executing)
+# Injects a unique alphanumeric marker plus the raw chars " ' < > to see which
+# survive unencoded, and in what context. It NEVER injects an executable
+# payload — context + unescaped special chars are reported for manual follow-up.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def phase_reflection_xss(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    phase = "reflection_xss"
+    if st.done(phase): return
+    section("Reflected Input / XSS Context Probe", out)
+    sess = make_session(cfg)
+
+    marker = "wrx" + hashlib.md5(os.urandom(6)).hexdigest()[:6]
+    # Distinctive, non-executing probe. Special chars test output encoding.
+    probe_chars = "<>\"'"
+    probe = f"{marker}{probe_chars}{marker}"
+
+    targets = DISCOVERED.get_urls_with_params(limit=40)
+    # Also probe common params on the base URL
+    common = ['q', 'search', 's', 'query', 'name', 'id', 'page', 'lang', 'redirect',
+              'keyword', 'term', 'msg', 'message', 'ref', 'callback']
+    base_targets = [f"{cfg.base_url}?{p}={probe}" for p in common]
+
+    tested = 0
+    reported_params: Set[str] = set()  # one report per (param) to avoid cross-source dupes
+    for tgt in (targets + base_targets):
+        if tested >= 60:
+            break
+        try:
+            parsed = urlparse(tgt)
+            qs = parse_qs(parsed.query)
+            if not qs:
+                continue
+            # Replace each param's value with the probe, one at a time
+            for pname in list(qs.keys()):
+                if pname in reported_params:
+                    continue
+                newqs = {k: (probe if k == pname else v[0]) for k, v in qs.items()}
+                query = '&'.join(f"{k}={v}" for k, v in newqs.items())
+                test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{query}"
+                r = sess.get(test_url, timeout=cfg.timeout)
+                tested += 1
+                if marker not in r.text:
+                    continue
+                ctype = r.headers.get('Content-Type', '').lower()
+                # Find what surrounds the marker
+                idx = r.text.find(marker)
+                window = r.text[max(0, idx - 1):idx + len(probe) + 1]
+                lt_raw = "<" in window
+                gt_raw = ">" in window
+                quote_raw = ('"' in window) or ("'" in window)
+                # Determine reflection context heuristically
+                pre = r.text[max(0, idx - 60):idx].lower()
+                if '<script' in pre and '</script>' not in pre:
+                    context = "inside <script> (JS)"
+                elif re.search(r'=\s*["\'][^"\']*$', r.text[max(0, idx-80):idx]):
+                    context = "HTML attribute value"
+                elif 'json' in ctype:
+                    context = "JSON response"
+                else:
+                    context = "HTML body"
+
+                reported_params.add(pname)
+                if lt_raw and gt_raw:
+                    sev = Severity.HIGH if 'json' not in ctype else Severity.LOW
+                    add_finding(Finding(
+                        title=f"Reflected Input — Unescaped `<>` via `{pname}`",
+                        severity=sev,
+                        description=(f"Parameter `{pname}` is reflected into the response in context "
+                                     f"[{context}] with `<` and `>` UNescaped — strong XSS indicator. "
+                                     f"(Probe was non-executing; confirm manually.)"),
+                        evidence=f"URL: {test_url}\nContext: {context}\nReflected window: {window[:120]}",
+                        recommendation="Context-aware output encoding (HTML-entity encode <,>,\",',&). Add a strong CSP as defence-in-depth.",
+                        phase=phase), out, cfg)
+                elif quote_raw and context in ("HTML attribute value", "inside <script> (JS)"):
+                    add_finding(Finding(
+                        title=f"Reflected Input — Unescaped Quote via `{pname}`",
+                        severity=Severity.MEDIUM,
+                        description=(f"Parameter `{pname}` is reflected into [{context}] with quote characters "
+                                     f"unescaped — may allow breaking out of the current context."),
+                        evidence=f"URL: {test_url}\nContext: {context}\nReflected window: {window[:120]}",
+                        recommendation="Encode quotes for the relevant context; avoid reflecting input into attribute/JS contexts.",
+                        phase=phase), out, cfg)
+                else:
+                    add_finding(Finding(
+                        title=f"Parameter Reflection (encoded) via `{pname}`",
+                        severity=Severity.INFO,
+                        description=f"Parameter `{pname}` is reflected in [{context}] but special characters appear encoded.",
+                        evidence=f"URL: {test_url}\nContext: {context}",
+                        recommendation="No immediate action; reflection noted for manual review.",
+                        phase=phase), out, cfg)
+        except Exception:
+            continue
+    if tested == 0:
+        _log(out, "> No parameterised URLs available to probe for reflection.")
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 5+ — SQL INJECTION (error-based + boolean-differential + time-based)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_SQL_ERRORS = [
+    r"you have an error in your sql syntax",
+    r"warning:\s+mysqli?_",
+    r"unclosed quotation mark after the character string",
+    r"quoted string not properly terminated",
+    r"pg_query\(\)|pg_exec\(\)|postgresql.*error",
+    r"sqlite_error|sqlite3::|near \".*\": syntax error",
+    r"ora-\d{5}",
+    r"microsoft ole db provider for sql server",
+    r"odbc sql server driver",
+    r"system\.data\.sqlclient\.sqlexception",
+    r"org\.hibernate\.|javax\.persistence",
+]
+
+def phase_sqli(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    """Differential SQLi detection. Time-based confirmation only runs when
+    intrusive checks are permitted (it sends SLEEP/pg_sleep payloads)."""
+    phase = "sqli"
+    if st.done(phase): return
+    section("SQL Injection Probe", out)
+    sess = make_session(cfg)
+
+    targets = DISCOVERED.get_urls_with_params(limit=30)
+    if not targets:
+        _log(out, "> No parameterised URLs available for SQLi testing.")
+        st.mark(phase); return
+
+    err_re = re.compile('|'.join(_SQL_ERRORS), re.I)
+
+    for tgt in targets:
+        try:
+            parsed = urlparse(tgt)
+            qs = parse_qs(parsed.query)
+        except Exception:
+            continue
+        if not qs:
+            continue
+
+        for pname, pvals in qs.items():
+            orig = pvals[0] if pvals else "1"
+
+            def build(value: str) -> str:
+                nq = {k: (value if k == pname else v[0]) for k, v in qs.items()}
+                q = '&'.join(f"{k}={v}" for k, v in nq.items())
+                return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{q}"
+
+            # ── Error-based ──
+            try:
+                er = sess.get(build(orig + "'\""), timeout=cfg.timeout)
+                if err_re.search(er.text):
+                    add_finding(Finding(
+                        title=f"SQL Injection (error-based) via `{pname}`",
+                        severity=Severity.CRITICAL,
+                        description=f"Injecting a quote into `{pname}` produced a database error message.",
+                        evidence=f"URL: {build(orig + chr(39) + chr(34))}\nMatched DB error in response.",
+                        recommendation="Use parameterised queries / prepared statements. Never concatenate user input into SQL.",
+                        phase=phase), out, cfg)
+                    continue  # confirmed; move to next param
+            except Exception:
+                pass
+
+            # ── Boolean-based differential ──
+            try:
+                base = sess.get(build(orig), timeout=cfg.timeout)
+                true_url  = build(f"{orig}' AND '1'='1")
+                false_url = build(f"{orig}' AND '1'='2")
+                tr = sess.get(true_url, timeout=cfg.timeout)
+                fr = sess.get(false_url, timeout=cfg.timeout)
+                lt, lf, lb = len(tr.text), len(fr.text), len(base.text)
+                # TRUE should resemble baseline; FALSE should differ markedly
+                true_like_base = abs(lt - lb) < max(40, lb * 0.02)
+                false_differs  = abs(lf - lt) > max(60, lt * 0.05)
+                if tr.status_code == fr.status_code == 200 and true_like_base and false_differs:
+                    add_finding(Finding(
+                        title=f"SQL Injection (boolean-based) via `{pname}`",
+                        severity=Severity.HIGH,
+                        description=(f"Parameter `{pname}` shows boolean-differential behaviour: the TRUE "
+                                     f"condition matches the baseline page while the FALSE condition diverges."),
+                        evidence=(f"baseline={lb}B  TRUE(1=1)={lt}B  FALSE(1=2)={lf}B\n"
+                                  f"TRUE:  {true_url}\nFALSE: {false_url}"),
+                        recommendation="Use parameterised queries. Validate/whitelist input types.",
+                        phase=phase), out, cfg)
+                    continue
+            except Exception:
+                pass
+
+            # ── Time-based confirmation (intrusive only) ──
+            if not cfg.no_intrusive:
+                try:
+                    # Baseline latency (median of 2)
+                    t0 = time.time(); sess.get(build(orig), timeout=cfg.timeout + 8); base_lat = time.time() - t0
+                    payloads = [
+                        f"{orig}' AND SLEEP(5)-- -",            # MySQL
+                        f"{orig}'; WAITFOR DELAY '0:0:5'-- -",   # MSSQL
+                        f"{orig}' AND pg_sleep(5)-- -",          # PostgreSQL
+                    ]
+                    for pl in payloads:
+                        t0 = time.time()
+                        sess.get(build(pl), timeout=cfg.timeout + 8)
+                        delay = time.time() - t0
+                        if delay > base_lat + 4:
+                            # Confirm with a second, longer sleep to rule out jitter
+                            confirm_pl = pl.replace("(5)", "(8)").replace("0:0:5", "0:0:8")
+                            t0 = time.time(); sess.get(build(confirm_pl), timeout=cfg.timeout + 12)
+                            delay2 = time.time() - t0
+                            if delay2 > base_lat + 7:
+                                add_finding(Finding(
+                                    title=f"SQL Injection (time-based blind) via `{pname}`",
+                                    severity=Severity.CRITICAL,
+                                    description=f"Parameter `{pname}` shows a time delay tracking an injected SLEEP — blind SQLi.",
+                                    evidence=(f"baseline≈{base_lat:.1f}s  5s-payload≈{delay:.1f}s  "
+                                              f"8s-confirm≈{delay2:.1f}s\nPayload: {pl}"),
+                                    recommendation="Use parameterised queries. This is exploitable blind SQLi — prioritise remediation.",
+                                    phase=phase), out, cfg)
+                                break
+                except Exception:
+                    pass
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 5+ — HTTP REQUEST SMUGGLING (timing-based CL.TE / TE.CL)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _raw_send(host: str, port: int, use_tls: bool, raw: bytes, read_timeout: float) -> float:
+    """Send a raw request over a fresh socket; return seconds until first byte
+    or socket timeout. Raises on connection error."""
+    import ssl as _ssl
+    s = socket.create_connection((host, port), timeout=read_timeout)
+    try:
+        if use_tls:
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            s = ctx.wrap_socket(s, server_hostname=host)
+        s.settimeout(read_timeout)
+        t0 = time.time()
+        s.sendall(raw)
+        try:
+            s.recv(64)
+        except socket.timeout:
+            return read_timeout
+        return time.time() - t0
+    finally:
+        try: s.close()
+        except Exception: pass
+
+
+def phase_request_smuggling(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    """Timing-based HTTP/1.1 desync detection (CL.TE and TE.CL). A vulnerable
+    front/back-end pair will stall waiting for body bytes that never arrive,
+    producing a measurable delay versus a well-formed baseline. Intrusive."""
+    phase = "request_smuggling"
+    if st.done(phase): return
+    section("HTTP Request Smuggling (timing probe)", out)
+    if cfg.no_intrusive:
+        _log(out, "> Request smuggling skipped (--no-intrusive)."); st.mark(phase); return
+    if cfg.proxy:
+        _log(out, "> Request smuggling skipped — raw socket probe is incompatible with --proxy.")
+        st.mark(phase); return
+
+    parsed = urlparse(cfg.base_url)
+    host = parsed.hostname
+    use_tls = parsed.scheme == 'https'
+    port = parsed.port or (443 if use_tls else 80)
+    path = parsed.path or '/'
+
+    CRLF = "\r\n"
+    def _base(extra_headers: str, body: str) -> bytes:
+        req = (f"POST {path} HTTP/1.1{CRLF}"
+               f"Host: {host}{CRLF}"
+               f"User-Agent: {cfg.user_agent}{CRLF}"
+               f"{extra_headers}"
+               f"Connection: close{CRLF}{CRLF}"
+               f"{body}")
+        return req.encode()
+
+    try:
+        # Baseline well-formed request
+        baseline = _raw_send(host, port, use_tls,
+                             _base(f"Content-Length: 0{CRLF}", ""), read_timeout=8.0)
+
+        # CL.TE: front-end uses Content-Length, back-end uses Transfer-Encoding.
+        # Malformed TE makes a vulnerable back-end wait for a terminating chunk.
+        clte_body = "1\r\nA\r\nX"  # incomplete final chunk
+        clte = _base(f"Content-Length: {len(clte_body)}{CRLF}"
+                     f"Transfer-Encoding: chunked{CRLF}", clte_body)
+        clte_time = _raw_send(host, port, use_tls, clte, read_timeout=10.0)
+
+        # TE.CL: front-end uses TE, back-end uses CL.
+        tecl_body = "0\r\n\r\nX"
+        tecl = _base(f"Content-Length: 4{CRLF}"
+                     f"Transfer-Encoding: chunked{CRLF}", tecl_body)
+        tecl_time = _raw_send(host, port, use_tls, tecl, read_timeout=10.0)
+
+        _log(out, f"- baseline≈{baseline:.1f}s  CL.TE≈{clte_time:.1f}s  TE.CL≈{tecl_time:.1f}s")
+
+        for label, t in (("CL.TE", clte_time), ("TE.CL", tecl_time)):
+            if t > baseline + 4 and t >= 7.0:
+                add_finding(Finding(
+                    title=f"Possible HTTP Request Smuggling ({label})",
+                    severity=Severity.HIGH,
+                    description=(f"A {label}-shaped request stalled (~{t:.0f}s) versus a ~{baseline:.0f}s "
+                                 f"baseline, consistent with a front-end/back-end desync. Requires manual "
+                                 f"confirmation (timing alone can yield false positives behind some proxies)."),
+                    evidence=f"baseline≈{baseline:.1f}s  {label}≈{t:.1f}s",
+                    recommendation="Normalise/clamp ambiguous Content-Length vs Transfer-Encoding; reject requests with both. Confirm with a controlled differential test before reporting as exploitable.",
+                    phase=phase), out, cfg)
+    except Exception as e:
+        _log(out, f"> Smuggling probe failed (likely benign): {e}")
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 5+ — WEBSOCKET DISCOVERY
+# ═════════════════════════════════════════════════════════════════════════════
+
+def phase_websocket(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    phase = "websocket"
+    if st.done(phase): return
+    section("WebSocket Discovery", out)
+    sess = make_session(cfg)
+
+    ws_endpoints: Set[str] = set()
+    try:
+        r = sess.get(cfg.base_url, timeout=cfg.timeout)
+        for m in re.finditer(r'wss?://[A-Za-z0-9_.\-:/]+', r.text):
+            ws_endpoints.add(m.group(0))
+        for m in re.finditer(r'new\s+WebSocket\(\s*["\']([^"\']+)', r.text):
+            ws_endpoints.add(m.group(1))
+    except Exception:
+        pass
+    # JS files already discovered
+    with DISCOVERED._lock:
+        js_urls = [u for u in DISCOVERED.urls if u.endswith('.js') or '.js?' in u][:15]
+    for ju in js_urls:
+        try:
+            jr = sess.get(ju, timeout=cfg.timeout)
+            for m in re.finditer(r'wss?://[A-Za-z0-9_.\-:/]+', jr.text):
+                ws_endpoints.add(m.group(0))
+            for m in re.finditer(r'new\s+WebSocket\(\s*["\']([^"\']+)', jr.text):
+                ws_endpoints.add(m.group(1))
+        except Exception:
+            continue
+
+    # Probe common WS paths via Upgrade handshake
+    common_ws = ["/ws", "/wss", "/socket", "/socket.io/?EIO=4&transport=websocket",
+                 "/cable", "/websocket", "/api/ws"]
+    for path in common_ws:
+        url = f"{cfg.base_url}{path}"
+        try:
+            key = base64.b64encode(os.urandom(16)).decode()
+            r = sess.get(url, timeout=cfg.timeout, headers={
+                "Connection": "Upgrade", "Upgrade": "websocket",
+                "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": key,
+                "Origin": "https://evil.example",
+            }, allow_redirects=False)
+            if r.status_code == 101 or 'sec-websocket-accept' in {k.lower() for k in r.headers}:
+                ws_endpoints.add(url)
+                add_finding(Finding(
+                    title=f"WebSocket Endpoint Accepts Cross-Origin Handshake: {path}",
+                    severity=Severity.MEDIUM,
+                    description=(f"The WebSocket endpoint at {path} completed an Upgrade handshake with a "
+                                 f"foreign Origin header — suggests missing origin validation (Cross-Site WebSocket Hijacking risk)."),
+                    evidence=f"GET {url} (Origin: https://evil.example) → HTTP {r.status_code}",
+                    recommendation="Validate the Origin header on WebSocket handshakes and tie sessions to anti-CSRF tokens.",
+                    phase=phase), out, cfg)
+        except Exception:
+            continue
+
+    if ws_endpoints:
+        add_finding(Finding(
+            title=f"WebSocket Endpoints Discovered ({len(ws_endpoints)})",
+            severity=Severity.INFO,
+            description="WebSocket endpoints were referenced or responded to handshakes.",
+            evidence='\n'.join(sorted(ws_endpoints)[:20]),
+            recommendation="Review WebSocket auth, origin checks, and message authorisation.",
+            phase=phase), out, cfg)
+    else:
+        _log(out, "> No WebSocket endpoints discovered.")
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 5+ — PROTOTYPE POLLUTION PROBE (server-side reflection / fault)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def phase_prototype_pollution(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    phase = "prototype_pollution"
+    if st.done(phase): return
+    section("Prototype Pollution Probe", out)
+    sess = make_session(cfg)
+    marker = "wrpp" + hashlib.md5(os.urandom(6)).hexdigest()[:6]
+
+    # Endpoints to probe: discovered API endpoints + base
+    with DISCOVERED._lock:
+        endpoints = [urljoin(cfg.base_url, e) for e in list(DISCOVERED.endpoints)[:8]
+                     if e.startswith('/')]
+    endpoints = list(dict.fromkeys([cfg.base_url] + endpoints))
+
+    hit = False
+    for url in endpoints:
+        # Query-string gadget
+        qs_url = f"{url}{'&' if '?' in url else '?'}__proto__[{marker}]=polluted"
+        try:
+            base = sess.get(url, timeout=cfg.timeout)
+            r = sess.get(qs_url, timeout=cfg.timeout)
+            # Server-side fault: pollution that breaks rendering → 500 where baseline was 2xx
+            if base.status_code < 500 <= r.status_code:
+                add_finding(Finding(
+                    title="Possible Prototype Pollution (server fault)",
+                    severity=Severity.MEDIUM,
+                    description=f"A `__proto__` gadget in the query string changed the response status from {base.status_code} to {r.status_code} at {url}.",
+                    evidence=f"Baseline {url} → {base.status_code}\nPolluted {qs_url} → {r.status_code}",
+                    recommendation="Reject/strip `__proto__`, `constructor`, `prototype` keys when merging untrusted objects. Use null-prototype objects or Map.",
+                    phase=phase), out, cfg)
+                hit = True
+        except Exception:
+            pass
+
+        # JSON body gadget
+        try:
+            payload = {"__proto__": {marker: "polluted"}}
+            base = sess.post(url, json={"x": 1}, timeout=cfg.timeout)
+            r = sess.post(url, json=payload, timeout=cfg.timeout)
+            if base.status_code < 500 <= r.status_code:
+                add_finding(Finding(
+                    title="Possible Prototype Pollution (JSON body, server fault)",
+                    severity=Severity.MEDIUM,
+                    description=f"A `__proto__` key in a JSON body changed the response status from {base.status_code} to {r.status_code} at {url}.",
+                    evidence=f"POST {url} {{\"x\":1}} → {base.status_code}\nPOST __proto__ gadget → {r.status_code}",
+                    recommendation="Sanitise keys before deep-merge; freeze Object.prototype; prefer Map/null-prototype objects.",
+                    phase=phase), out, cfg)
+                hit = True
+            # Reflected marker on a prototype key is a strong signal
+            elif marker in r.text and marker not in base.text:
+                add_finding(Finding(
+                    title="Prototype Pollution Gadget Reflected",
+                    severity=Severity.LOW,
+                    description=f"The injected `__proto__` marker was reflected in the response at {url} — investigate for pollution side-effects.",
+                    evidence=f"POST {url} with __proto__[{marker}] → marker present in response.",
+                    recommendation="Verify the server does not merge attacker keys into shared objects/prototypes.",
+                    phase=phase), out, cfg)
+                hit = True
+        except Exception:
+            pass
+
+    if not hit:
+        _log(out, "> No prototype pollution side-effects observed.")
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
 # FINAL REPORTS (Markdown + HTML)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -3005,12 +4069,13 @@ def main():
     try:
         # ── Phase 1: Passive ──────────────────────────────────────────────
         print(f"\n{Fore.MAGENTA}[ PHASE 1 — PASSIVE RECONNAISSANCE ]")
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             futs = {
                 pool.submit(phase_passive_dns, target, tt, cfg, out, state, scope): "dns",
                 pool.submit(phase_cert_transparency, target, tt, cfg, out, state):  "crt.sh",
                 pool.submit(phase_wayback, target, cfg, out, state):                "wayback",
                 pool.submit(phase_google_dorks, target, cfg, out, state):           "dorks",
+                pool.submit(phase_dns_security, target, tt, cfg, out, state):       "dns_sec",
             }
             for fut in as_completed(futs):
                 try: fut.result()
@@ -3041,16 +4106,19 @@ def main():
             phase_tech_playbooks(target, cfg, out, state, detected_tech)
             phase_robots_sitemap(target, tt, cfg, out, state)
             phase_crawler(target, cfg, out, state)
+            phase_api_schema(target, cfg, out, state)
+            phase_source_exposure(target, cfg, out, state)
             phase_content_discovery(target, cfg, out, state)
             phase_param_discovery(target, cfg, out, state)
 
             # ── Phase 4: HTTP Analysis ─────────────────────────────────────
             print(f"\n{Fore.MAGENTA}[ PHASE 4 — HTTP ANALYSIS ]")
-            with ThreadPoolExecutor(max_workers=3) as pool:
+            with ThreadPoolExecutor(max_workers=4) as pool:
                 futs = {
                     pool.submit(phase_header_analysis, target, cfg, out, state): "headers",
                     pool.submit(phase_cors, target, cfg, out, state):             "cors",
                     pool.submit(phase_oauth_oidc, target, cfg, out, state):       "oidc",
+                    pool.submit(phase_csp_analysis, target, cfg, out, state):     "csp",
                 }
                 for fut in as_completed(futs):
                     try: fut.result()
@@ -3059,6 +4127,8 @@ def main():
             phase_host_header(target, cfg, out, state)
             phase_crlf(target, cfg, out, state)
             phase_jwt_analysis(target, cfg, out, state)
+            phase_http_methods(target, cfg, out, state)
+            phase_403_bypass(target, cfg, out, state)
 
             if is_full:
                 # ── Phase 5: Vulnerability Scanning ─────────────────────────
@@ -3066,12 +4136,16 @@ def main():
                 phase_ssl_tls(target, cfg, out, state)
                 phase_nikto(target, cfg, out, state)
                 phase_nuclei(target, cfg, out, state)
-                with ThreadPoolExecutor(max_workers=4) as pool:
+                with ThreadPoolExecutor(max_workers=6) as pool:
                     futs = {
-                        pool.submit(phase_js_analysis, target, cfg, out, state):    "js",
-                        pool.submit(phase_graphql, target, cfg, out, state):        "graphql",
-                        pool.submit(phase_path_traversal, target, cfg, out, state): "lfi",
-                        pool.submit(phase_open_redirect, target, cfg, out, state):  "redirect",
+                        pool.submit(phase_js_analysis, target, cfg, out, state):         "js",
+                        pool.submit(phase_graphql, target, cfg, out, state):             "graphql",
+                        pool.submit(phase_path_traversal, target, cfg, out, state):      "lfi",
+                        pool.submit(phase_open_redirect, target, cfg, out, state):       "redirect",
+                        pool.submit(phase_reflection_xss, target, cfg, out, state):      "xss",
+                        pool.submit(phase_sqli, target, cfg, out, state):                "sqli",
+                        pool.submit(phase_websocket, target, cfg, out, state):           "websocket",
+                        pool.submit(phase_prototype_pollution, target, cfg, out, state): "protopollution",
                     }
                     for fut in as_completed(futs):
                         try: fut.result()
@@ -3081,6 +4155,7 @@ def main():
                 phase_ssti(target, cfg, out, state)
                 phase_xxe(target, cfg, out, state)
                 phase_default_creds(target, cfg, out, state)
+                phase_request_smuggling(target, cfg, out, state)
 
                 # ── Phase 6: Infrastructure ──────────────────────────────────
                 print(f"\n{Fore.MAGENTA}[ PHASE 6 — INFRASTRUCTURE ]")
@@ -3147,6 +4222,7 @@ def main():
                 "ffuf":       "apt install ffuf",
                 "whatweb":    "apt install whatweb",
                 "nmap":       "apt install nmap",
+                "dig":        "apt install dnsutils   (or bind-utils on RHEL)",
             }
             print(f"\n{Fore.YELLOW}  ⚠ Coverage gap — these tools were not installed and their phases skipped:")
             _log(out, "\n\n## Tool Availability Summary\n\n"
