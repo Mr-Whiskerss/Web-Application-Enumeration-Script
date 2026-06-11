@@ -4,7 +4,29 @@
 
 **WebRecon** is a single-file Python tool that automates the web-application phase of an external or internal pentest — passive OSINT, active recon, content discovery, technology fingerprinting, vulnerability probing, and reporting — with resumable state, authenticated scanning, and multi-format output.
 
-It's a glue layer around the tools you already use (nuclei, katana, arjun, ffuf, nmap, wpscan, wafw00f, subfinder, etc.) plus ~2800 lines of first-party Python checks covering the gaps those tools leave: JWT deep analysis, CORS, security headers, SSRF/SSTI/CRLF/host-header injection, cloud-metadata probing, default credentials, favicon-hash pivoting, JS secret extraction, and more.
+It's a glue layer around the tools you already use (nuclei, katana, arjun, ffuf, nmap, wpscan, wafw00f, subfinder, etc.) plus ~4200 lines of first-party Python checks covering the gaps those tools leave: JWT deep analysis, CORS, security headers, SSRF/SSTI/CRLF/host-header injection, cloud-metadata probing, default credentials, favicon-hash pivoting, JS secret extraction, **differential SQLi, reflected-XSS context analysis, HTTP request smuggling, verb tampering, 401/403 bypass, deep CSP analysis, OpenAPI/Swagger/WSDL schema mining, VCS/source exposure, WebSocket discovery, prototype pollution, DNS posture (SPF/DMARC/DNSSEC/CAA/AXFR)**, and more.
+
+---
+
+## What's new in v3.2.0
+
+Eleven new first-party phases, all built in the existing idiom — catch-all/false-positive suppression, fed by (and feeding) the shared discovery state, and gated by the same scan profiles and `--no-intrusive` switch:
+
+- **DNS security posture** — SPF / DMARC / DNSSEC / CAA review + zone-transfer (AXFR) attempt *(Phase 1)*
+- **API schema discovery** — parses OpenAPI / Swagger / WSDL and feeds discovered endpoints + parameters into every downstream injection phase *(Phase 3)*
+- **Source / VCS / config exposure** — `.git`, `.svn`, `.hg`, `.DS_Store`, `.env`, `.htpasswd`, backup / swap files (each gated on a content signature) *(Phase 3)*
+- **HTTP methods & verb tampering** — dangerous verbs, TRACE/XST, live PUT upload test, verb-based auth bypass *(Phase 4)*
+- **401 / 403 bypass** — path-normalisation and header-override techniques *(Phase 4)*
+- **Deep CSP analysis** — flags `unsafe-inline`, `unsafe-eval`, wildcard sources, missing `object-src` / `base-uri` / `frame-ancestors` *(Phase 4)*
+- **SQL injection** — error-based + boolean-differential + double-confirmed time-based blind *(Phase 5)*
+- **Reflected input / XSS context probe** — non-executing differential canary with HTML / attribute / JS / JSON context classification *(Phase 5)*
+- **HTTP request smuggling** — timing-based CL.TE / TE.CL desync detection *(Phase 5)*
+- **WebSocket discovery** — endpoint enumeration + cross-origin handshake (CSWSH) check *(Phase 5)*
+- **Prototype pollution** — `__proto__` gadget probes via query string and JSON body *(Phase 5)*
+
+Plus: per-cookie `HttpOnly` / `SameSite` precision (now inspects each cookie's own attributes, and flags `SameSite=None` without `Secure`), and an ASP.NET / IIS technology playbook.
+
+The intrusive subset (live PUT upload, time-based SQLi, request smuggling) only runs when intrusive checks are enabled, so `--profile recon` / `--profile stealth` / `--no-intrusive` stay safe.
 
 ---
 
@@ -12,6 +34,7 @@ It's a glue layer around the tools you already use (nuclei, katana, arjun, ffuf,
 
 ### Passive reconnaissance
 - DNS, WHOIS, ASN lookups (domain-age flag, IPv6 presence check)
+- **DNS security posture** — SPF, DMARC (policy-enforcement check), DNSSEC, CAA, plus an AXFR zone-transfer attempt against each authoritative nameserver
 - Certificate transparency (crt.sh)
 - Wayback Machine URL + parameter mining — parameters are fed into later fuzzing phases
 - Google dork URL generation (+ optional Custom Search API automation)
@@ -35,6 +58,9 @@ It's a glue layer around the tools you already use (nuclei, katana, arjun, ffuf,
   - **Spring Boot** → actuator sweep (env, heapdump, mappings, trace, etc.)
   - **Tomcat** → manager / host-manager / examples
   - **Jenkins** → `/script`, `/manage`, `/asynchPeople/`
+  - **ASP.NET / IIS** → trace.axd, elmah.axd, web.config, FrontPage extensions, App_Data/bin/App_Code probing (with per-endpoint confirmation strings)
+- **API schema discovery** — OpenAPI / Swagger (JSON spec + UI), WSDL/SOAP; parsed endpoints and parameters are pushed into the shared discovery state so SQLi / XSS / SSRF / traversal phases test the **real API surface**
+- **Source / VCS / config exposure** — `.git/HEAD` + `.git/config`, `.svn`, `.hg`, `.DS_Store`, `.env`, `.htpasswd`, `phpinfo`, `server-status` / `server-info`, Docker artefacts, and backup / editor-swap files — every hit requires a content signature to avoid catch-all 200 false positives
 - robots.txt, sitemap.xml, security.txt, well-known endpoints
 - URL crawling (katana) — feeds URLs + params into downstream phases
 - Content discovery (ffuf) — general + admin-panel wordlist
@@ -42,11 +68,14 @@ It's a glue layer around the tools you already use (nuclei, katana, arjun, ffuf,
 
 ### HTTP analysis
 - Security header audit (HSTS, CSP, X-Frame-Options, X-CTO, Referrer-Policy, Permissions-Policy)
-- Cookie audit (Secure, HttpOnly, SameSite)
+- **Deep CSP analysis** — parses the policy and flags `unsafe-inline` (without nonce/hash/strict-dynamic), `unsafe-eval`, wildcard / broad-scheme sources, and missing `object-src` / `base-uri` / `frame-ancestors`
+- Cookie audit (per-cookie Secure, HttpOnly, SameSite — including `SameSite=None` without `Secure`)
 - Information disclosure (Server, X-Powered-By, X-AspNet-Version)
 - CORS misconfiguration (origin reflection, wildcard + credentials)
 - **Host header injection** (Host, X-Forwarded-Host, X-Host canary reflection)
 - **CRLF injection** (common + crawler-discovered parameters)
+- **HTTP methods & verb tampering** — OPTIONS enumeration, TRACE / XST, live PUT upload test (auto-cleaned up, intrusive only), and verb-based auth bypass against protected paths
+- **401 / 403 bypass** — trailing slash / dot, double slash, `%2e`, `..;/`, encoded slash, case mutation, and `X-Original-URL` / `X-Rewrite-URL` / client-IP header overrides, confirmed by content-length divergence from the deny page
 - OAuth / OIDC endpoint discovery (`.well-known/*`, JWKS, token endpoints)
 - **JWT deep analysis**:
   - `alg:none` acceptance
@@ -56,11 +85,16 @@ It's a glue layer around the tools you already use (nuclei, katana, arjun, ffuf,
 
 ### Vulnerability scanning
 - **Nuclei** — CVE / misconfig templates with severity filter and intrusive-tag gating
+- **SQL injection** — error-based (DB error signatures), boolean-based differential (TRUE matches baseline / FALSE diverges), and double-confirmed time-based blind (MySQL `SLEEP`, MSSQL `WAITFOR`, PostgreSQL `pg_sleep`); time-based confirmation is intrusive only
+- **Reflected input / XSS context probe** — injects a unique, **non-executing** marker plus raw `< > " '` to see which survive unencoded and in what context (HTML body / attribute / inside `<script>` / JSON); one report per parameter
 - **SSRF** — OOB-based with unique markers per parameter + cloud metadata sweep (AWS, GCP, DigitalOcean, file://)
 - **SSTI** — Jinja2, Twig, FreeMarker, ERB, Thymeleaf, Razor with arithmetic canary
 - **XXE** — classic external entity, blind parameter-entity via external DTD, SOAP envelope, SVG-embedded
+- **HTTP request smuggling** — timing-based CL.TE and TE.CL desync detection over a raw socket (intrusive; skipped under `--proxy`; flagged for manual confirmation)
 - **Path traversal** — common encodings + per-parameter testing
 - **Open redirect** — standard + crawler-discovered redirect-like params
+- **Prototype pollution** — `__proto__` gadget via query string and JSON body, detecting server-side faults and reflected gadgets
+- **WebSocket discovery** — endpoint extraction from HTML/JS + Upgrade-handshake probing with a foreign Origin to surface missing origin validation (CSWSH)
 - **Default credentials** — Tomcat (Basic), Jenkins, WordPress (form), Grafana-style (JSON) — explicit success/failure text checks, no false positives from generic 200s
 - **JS secret extraction** — AWS access keys, API keys, tokens, JWTs, private keys, Google/Slack/GitHub tokens, Basic-auth-in-URL, hardcoded passwords, internal IPs
 - GraphQL endpoint detection + introspection probe
@@ -76,6 +110,7 @@ It's a glue layer around the tools you already use (nuclei, katana, arjun, ffuf,
 - **Scope enforcement** (IPv4 + IPv6 CIDRs + domains, with DNS-resolution scope check)
 - **Scan profiles**: `recon` / `active` / `full` / `stealth`
 - **Authenticated scanning** — cookies, arbitrary headers (Bearer, API keys), session revalidation
+- **API-aware** — discovered schemas expand the attack surface tested by every injection phase
 - **Adaptive rate limiting** — backs off exponentially on 429/503, global across all threads
 - **Proxy-aware** — Burp, ZAP, mitmproxy (HTTP + SOCKS)
 - **Diff mode** — delta findings against a previous scan
@@ -107,6 +142,7 @@ nuclei -update-templates
 # System packages (Debian / Ubuntu example)
 sudo apt install nmap nikto whatweb ffuf wafw00f theharvester dnsrecon \
                  whois dnsutils testssl.sh
+# dnsutils provides `dig`, used by the DNS security-posture phase
 
 # CMS-specific (install as needed)
 sudo gem install wpscan                       # WordPress
@@ -115,7 +151,7 @@ pip install droopescan                        # Drupal
 # gowitness → https://github.com/sensepost/gowitness
 ```
 
-WebRecon degrades gracefully — any missing external tool causes its phase to log a warning and skip. The scan continues.
+WebRecon degrades gracefully — any missing external tool causes its phase to log a warning and skip. The scan continues. The new injection, exposure, CSP, methods, smuggling, WebSocket and prototype-pollution phases are pure first-party Python and need no external tools; the DNS-posture phase only needs `dig`.
 
 ---
 
@@ -154,7 +190,7 @@ WebRecon degrades gracefully — any missing external tool causes its phase to l
 | `full`    | All phases *(default)*                   | default          | enabled   |
 | `stealth` | All phases                               | ≤10 req/s, 2 thr | disabled  |
 
-`--no-intrusive` can be applied to any profile to skip Nikto and nuclei-tagged `intrusive` / `fuzz` / `dos` templates.
+`--no-intrusive` can be applied to any profile to skip Nikto, nuclei-tagged `intrusive` / `fuzz` / `dos` templates, **and the intrusive-only checks added in v3.2.0** (live PUT upload test, time-based SQLi confirmation, HTTP request smuggling). Error-based and boolean-based SQLi, reflected-XSS, verb tampering and 403-bypass remain active — they are non-destructive.
 
 ---
 
@@ -232,6 +268,7 @@ EOF
 ssh -D 1080 jumpbox.client.corp &
 ./web_app.py -t internal.app.client.corp --auto \
   --proxy socks5://127.0.0.1:1080
+# Note: the request-smuggling phase auto-skips under --proxy (it needs a raw socket)
 ```
 
 ---
@@ -258,7 +295,7 @@ Run `./web_app.py --help` for the full list.
 | `--diff`                   | Previous findings JSON (delta report)                       |
 | `--resume` / `--fresh`     | Resume interrupted / clear state                            |
 | `--full-ports`             | Full TCP port scan (`-p-`)                                  |
-| `--no-intrusive`           | Skip Nikto + nuclei intrusive templates                     |
+| `--no-intrusive`           | Skip Nikto, nuclei intrusive templates, live PUT, time-based SQLi, smuggling |
 | `--nuclei-severity`        | Nuclei severity filter                                      |
 | `--google-api-key/-cx`     | Google Custom Search (automated dorking)                    |
 | `--threads`                | Parallel phase threads                                      |
@@ -281,13 +318,13 @@ A single scan produces:
 
 Findings are categorised:
 
-| Severity   | When used                                                          |
-|------------|--------------------------------------------------------------------|
-| `CRITICAL` | Confirmed RCE, auth bypass, default creds, SSRF→metadata, SSTI     |
-| `HIGH`     | Subdomain takeover, exposed admin, LFI, JWT weak secret            |
-| `MEDIUM`   | CORS misconfig, missing CSP, weak cookies, open redirect           |
-| `LOW`      | Missing low-impact headers, information disclosure                 |
-| `INFO`     | Enumerated data (subdomains, URLs, tech stack, favicon hash)       |
+| Severity   | When used                                                                          |
+|------------|------------------------------------------------------------------------------------|
+| `CRITICAL` | RCE, auth bypass, default creds, SSRF→metadata, SSTI, SQLi (error/time-based), PUT upload, exposed `.env` |
+| `HIGH`     | Subdomain takeover, exposed admin, LFI, JWT weak secret, boolean SQLi, reflected unescaped `<>`, verb / 403 bypass, request smuggling, VCS exposure |
+| `MEDIUM`   | CORS misconfig, weak CSP, weak cookies, open redirect, TRACE/XST, CSWSH, host-header injection, prototype pollution |
+| `LOW`      | Missing low-impact headers, information disclosure, dangerous methods advertised   |
+| `INFO`     | Enumerated data (subdomains, URLs, tech stack, favicon hash, API endpoints, WebSocket endpoints) |
 
 The HTML report supports severity filtering and full-text search — drop it in a browser.
 
@@ -298,26 +335,32 @@ The HTML report supports severity filtering and full-text search — drop it in 
 WebRecon organises checks into six phases, executed in order. Earlier-phase discoveries feed later phases via a thread-safe `DiscoveredState` store:
 
 ```
-Phase 1 — Passive recon      (DNS, crt.sh, wayback, dorks, subdomains, favicon)
+Phase 1 — Passive recon      (DNS, DNS-security, crt.sh, wayback, dorks,
+                              subdomains, favicon)
                                          │
                                          ▼ feeds URLs + params
 Phase 2 — Active recon       (nmap, wafw00f, vhost fuzzing)
                                          │
                                          ▼
-Phase 3 — Tech & content     (whatweb, playbooks, robots, katana, ffuf, arjun)
+Phase 3 — Tech & content     (whatweb, playbooks, robots, katana,
+                              API schema, source/VCS exposure, ffuf, arjun)
                                          │
                                          ▼ feeds URLs + params + endpoints
-Phase 4 — HTTP analysis      (headers, cors, host-header, crlf, oidc, jwt)
+Phase 4 — HTTP analysis      (headers, CSP, cors, host-header, crlf, oidc,
+                              jwt, http-methods/verb-tamper, 401/403 bypass)
                                          │
                                          ▼
 Phase 5 — Vulnerability      (ssl, nuclei, js, graphql, lfi, redirect,
-                              ssrf, ssti, xxe, default-creds)
+                              reflected-xss, sqli, websocket, proto-pollution,
+                              ssrf, ssti, xxe, default-creds, smuggling)
                                          │
                                          ▼
 Phase 6 — Infrastructure     (cloud buckets, screenshots)
 ```
 
-Parameters harvested by the crawler and wayback mining feed SSRF / SSTI / CRLF / path-traversal / open-redirect / XXE probes, so those phases test the target's actual attack surface rather than a hardcoded generic parameter list.
+Parameters and endpoints harvested by the crawler, wayback mining **and parsed API schemas** feed the SQLi / XSS / SSRF / SSTI / CRLF / path-traversal / open-redirect / XXE / prototype-pollution probes, so those phases test the target's actual attack surface rather than a hardcoded generic parameter list.
+
+Every check that infers "a path exists because it returned 200" first runs through catch-all detection (a random unlikely path is probed at scan start, and its response signature is compared against), and content-dependent findings (VCS files, API specs, SQLi, reflected XSS) additionally require a confirming signature or differential — so SPA / CDN / WAF catch-all routing does not generate false positives.
 
 ---
 
@@ -330,6 +373,7 @@ Parameters harvested by the crawler and wayback mining feed SSRF / SSTI / CRLF /
 | Dependency    | Feature                                    |
 |---------------|--------------------------------------------|
 | `mmh3`        | Shodan-compatible favicon hash             |
+| `dig` (dnsutils) | DNS security posture (SPF/DMARC/DNSSEC/CAA/AXFR) |
 | `nmap`        | Port scanning                              |
 | `nuclei`      | Template-based vulnerability scanning      |
 | `katana`      | Crawling (feeds later phases)              |
@@ -349,11 +393,13 @@ Parameters harvested by the crawler and wayback mining feed SSRF / SSTI / CRLF /
 | `dnsrecon`    | DNS reconnaissance                         |
 | `gowitness`   | Screenshots                                |
 
+The SQLi, reflected-XSS, CSP, HTTP-methods, 401/403-bypass, request-smuggling, WebSocket, prototype-pollution, source-exposure and API-schema phases are pure first-party Python and have **no external tool dependency**.
+
 ---
 
 ## Ethical use
 
-WebRecon is a penetration-testing tool. **Only run it against systems you own or have explicit, written authorisation to test.** Unauthorised access to computer systems is a criminal offence in most jurisdictions (Computer Misuse Act 1990, Computer Fraud and Abuse Act, etc.). The author accepts no responsibility for misuse.
+WebRecon is a penetration-testing tool. **Only run it against systems you own or have explicit, written authorisation to test.** The intrusive checks (PUT upload, time-based SQLi, request smuggling) actively modify state or stress the target — keep them disabled with `--no-intrusive` unless your rules of engagement permit them. Unauthorised access to computer systems is a criminal offence in most jurisdictions (Computer Misuse Act 1990, Computer Fraud and Abuse Act, etc.). The author accepts no responsibility for misuse.
 
 ---
 
