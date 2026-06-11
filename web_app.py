@@ -3883,9 +3883,12 @@ Examples:
   web_app.py -t example.com --auto --diff previous.findings.json
   web_app.py -t example.com --webhook-url https://discord.com/api/webhooks/... --pentestdb-url http://pi:5000
   web_app.py -t example.com --resume
+  web_app.py -iL targets.txt --auto --profile stealth
         """)
     p.add_argument("-t", "--target",        help="Target domain or IP (host:port also accepted)")
     p.add_argument("-o", "--output",        default="webrecon", help="Output file prefix")
+    p.add_argument("-iL", "--target-list",  dest="target_list",
+                   help="File of targets, one per line (domain/IP/host:port; # comments and blank lines ignored). Each target is scanned in turn with its own <prefix>_<target>.* outputs.")
     p.add_argument("--auto",                action="store_true",
                    help="Skip interactive prompts (run all phases non-interactively)")
     p.add_argument("--proxy",               help="Proxy URL (e.g. http://127.0.0.1:8080)")
@@ -3945,6 +3948,74 @@ def _apply_profile(args, cfg: ScanConfig) -> ScanConfig:
     return cfg
 
 
+def _target_prefix(base: str, target: str, batch: bool) -> str:
+    """Single -t scans keep the bare prefix; batch scans get a per-target suffix."""
+    if not batch:
+        return base
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', target)
+    return f"{base}_{safe}"
+
+
+def _reset_scan_state():
+    """Clear all shared, scan-scoped globals between batch targets (in place,
+    so existing references in the phase functions keep working)."""
+    with _findings_lock:
+        _findings.clear()
+        _finding_keys.clear()
+    with _MISSING_TOOLS_LOCK:
+        _MISSING_TOOLS.clear()
+    with DISCOVERED._lock:
+        DISCOVERED.urls.clear()
+        DISCOVERED.params.clear()
+        DISCOVERED.endpoints.clear()
+    with RateLimitedSession._lock:
+        RateLimitedSession._consecutive_429   = 0
+        RateLimitedSession._backoff_until     = 0.0
+        RateLimitedSession._announced_backoff = False
+
+
+def _print_batch_summary(results, batch_start):
+    dur = datetime.now() - batch_start
+    print(f"\n{Fore.MAGENTA}{'═'*60}")
+    print(f"{Fore.GREEN}  BATCH COMPLETE — {len(results)} target(s) in {str(dur).split('.')[0]}")
+    print(f"{Fore.MAGENTA}{'═'*60}")
+    tot = Counter()
+    for target, prefix, counts in results:
+        tot.update(counts)
+        print(f"  {Fore.WHITE}{target}")
+        print(f"    {Fore.MAGENTA}{counts.get(Severity.CRITICAL,0)} CRIT  "
+              f"{Fore.RED}{counts.get(Severity.HIGH,0)} HIGH  "
+              f"{Fore.YELLOW}{counts.get(Severity.MEDIUM,0)} MED  "
+              f"{Fore.GREEN}{counts.get(Severity.LOW,0)} LOW  "
+              f"{Fore.CYAN}{counts.get(Severity.INFO,0)} INFO   "
+              f"{Fore.WHITE}→ {prefix}.report.html")
+    print(f"\n{Fore.WHITE}  TOTAL  "
+          f"{Fore.MAGENTA}{tot.get(Severity.CRITICAL,0)} CRIT  "
+          f"{Fore.RED}{tot.get(Severity.HIGH,0)} HIGH  "
+          f"{Fore.YELLOW}{tot.get(Severity.MEDIUM,0)} MED  "
+          f"{Fore.GREEN}{tot.get(Severity.LOW,0)} LOW  "
+          f"{Fore.CYAN}{tot.get(Severity.INFO,0)} INFO")
+    print(f"{Fore.MAGENTA}{'═'*60}\n")
+
+
+def _load_targets(args) -> List[str]:
+    """Return the list of raw target strings: from -iL file, or a single -t / prompt."""
+    if args.target_list:
+        if not os.path.exists(args.target_list):
+            print(f"{Fore.RED}  [!] Target list not found: {args.target_list}"); sys.exit(1)
+        out = []
+        with open(args.target_list) as fh:
+            for line in fh:
+                line = line.split('#', 1)[0].strip()  # strip inline comments
+                if line:
+                    out.append(line)
+        if not out:
+            print(f"{Fore.RED}  [!] Target list is empty: {args.target_list}"); sys.exit(1)
+        return out
+    raw = args.target or input(f"{Fore.CYAN}  Target (domain or IP): ").strip()
+    return [raw]
+
+
 def main():
     args = parse_args()
 
@@ -3952,25 +4023,70 @@ def main():
     print(f"{Fore.MAGENTA}  WebRecon v{VERSION}")
     print(f"{Fore.MAGENTA}{'═'*60}\n")
 
-    raw = args.target or input(f"{Fore.CYAN}  Target (domain or IP): ").strip()
-    target = normalise(raw)
-
-    tt = validate(target)
-    if not tt:
-        print(f"{Fore.RED}  [!] Invalid target: {target!r}"); sys.exit(1)
-    try:
-        sanitise(target)
-    except ValueError as e:
-        print(f"{Fore.RED}  [!] {e}"); sys.exit(1)
-
-    out       = args.output + ".md"
-    findings  = args.output + ".findings.json"
-    state_f   = args.output + ".state.json"
-    html_path = args.output + ".report.html"
-
     scope = ScopeChecker(args.scope_file)
-    if not scope.check(target):
-        print(f"{Fore.RED}  [!] {target} is OUT OF SCOPE — aborting."); sys.exit(1)
+
+    # Resolve, validate, sanitise and scope-check every target up front;
+    # invalid / out-of-scope entries are skipped (not fatal) in batch mode.
+    targets = _load_targets(args)
+    batch = bool(args.target_list) or len(targets) > 1
+    work, seen = [], set()
+    for rawt in targets:
+        t = normalise(rawt)
+        if t in seen:
+            continue
+        seen.add(t)
+        tt = validate(t)
+        if not tt:
+            print(f"{Fore.YELLOW}  [SKIP] Invalid target: {t!r}"); continue
+        try:
+            sanitise(t)
+        except ValueError as e:
+            print(f"{Fore.YELLOW}  [SKIP] {e}"); continue
+        if not scope.check(t):
+            print(f"{Fore.YELLOW}  [SKIP] Out of scope: {t}"); continue
+        work.append((t, tt))
+
+    if not work:
+        print(f"{Fore.RED}  [!] No valid, in-scope targets — aborting."); sys.exit(1)
+    if batch:
+        print(f"{Fore.CYAN}  Batch mode: {len(work)} target(s) queued.")
+
+    batch_start = datetime.now()
+    results = []
+    for idx, (t, tt) in enumerate(work, 1):
+        if batch:
+            print(f"\n{Fore.MAGENTA}{'━'*60}")
+            print(f"{Fore.MAGENTA}  [{idx}/{len(work)}]  {t}")
+            print(f"{Fore.MAGENTA}{'━'*60}")
+        prefix = _target_prefix(args.output, t, batch)
+        try:
+            counts = run_single_target(args, t, tt, scope, prefix)
+            results.append((t, prefix, counts))
+        except KeyboardInterrupt:
+            print(f"\n{Fore.YELLOW}  Batch interrupted — stopping after {idx} target(s). "
+                  f"Re-run with --resume to continue this target.")
+            results.append((t, prefix, Counter(f.severity for f in _findings)))
+            break
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"{Fore.RED}  [!] {t} failed: {e}")
+            results.append((t, prefix, Counter()))
+
+    if batch:
+        _print_batch_summary(results, batch_start)
+
+
+def run_single_target(args, target, tt, scope, output_prefix):
+    """Run a complete scan against one target. Returns a severity Counter."""
+    out       = output_prefix + ".md"
+    findings  = output_prefix + ".findings.json"
+    state_f   = output_prefix + ".state.json"
+    html_path = output_prefix + ".report.html"
+
+    # Fresh per-target globals so findings / dedup / discovery / rate-limit
+    # state never bleed from one batch target into the next.
+    _reset_scan_state()
 
     state = ScanState(state_f, target)
     if args.fresh:
@@ -3980,7 +4096,7 @@ def main():
     # Build initial config so detect_scheme uses the auth/proxy settings
     cfg_stub = ScanConfig(
         target=target, target_type=tt, base_url=f"http://{target}",
-        output_prefix=args.output,
+        output_prefix=output_prefix,
         proxy=args.proxy, user_agent=args.user_agent, timeout=args.timeout,
         cookie=args.cookie, extra_headers=args.headers or [],
     )
@@ -3991,7 +4107,7 @@ def main():
     cfg = ScanConfig(
         target=target, target_type=tt,
         base_url=f"{scheme}://{target}",
-        output_prefix=args.output,
+        output_prefix=output_prefix,
         proxy=args.proxy,
         user_agent=args.user_agent,
         timeout=args.timeout,
@@ -4065,6 +4181,7 @@ def main():
         detect_catchall(cfg, out)
 
     detected_tech: Dict = {}
+    interrupted = False
 
     try:
         # ── Phase 1: Passive ──────────────────────────────────────────────
@@ -4169,6 +4286,7 @@ def main():
                         except Exception as e: print(f"  {Fore.RED}✗ {futs[fut]}: {e}")
 
     except KeyboardInterrupt:
+        interrupted = True
         print(f"\n{Fore.YELLOW}  Interrupted — state saved. Re-run with --resume to continue.")
         _log(out, "\n\n---\n*Scan interrupted by user.*")
 
@@ -4238,6 +4356,11 @@ def main():
             _log(out, "\n\n## Tool Availability Summary\n\nAll optional tools were installed during this scan.")
 
         print(f"{Fore.MAGENTA}{'═'*60}\n")
+
+    counts = Counter(f.severity for f in _findings)
+    if interrupted:
+        raise KeyboardInterrupt
+    return counts
 
 
 if __name__ == "__main__":
