@@ -12,7 +12,8 @@ covering the gaps those tools leave: JWT deep analysis, CORS, security
 headers, SSRF/SSTI/CRLF/host-header injection, cloud-metadata probing,
 default-credential testing, favicon-hash pivoting, JS secret extraction,
 differential SQLi (error/boolean/time), reflected-XSS context analysis,
-HTTP request smuggling (CL.TE/TE.CL timing), verb tampering, 401/403
+CSRF token-presence checks, HTTP request smuggling (CL.TE/TE.CL timing),
+verb tampering, 401/403
 bypass, deep CSP analysis, OpenAPI/Swagger/WSDL schema mining, VCS/source
 exposure (.git/.svn/.env/backups), WebSocket discovery, prototype
 pollution, and DNS posture (SPF/DMARC/DNSSEC/CAA/AXFR).
@@ -64,7 +65,7 @@ from enum import Enum
 from typing import Optional, List, Dict, Tuple, Set
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, urljoin, parse_qs
+from urllib.parse import urlparse, urljoin, parse_qs, quote
 from collections import Counter
 
 # ── Dependency checks ────────────────────────────────────────────────────────
@@ -98,7 +99,7 @@ if _MISSING:
     sys.exit(1)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION        = "3.2.0"
+VERSION        = "3.3.0"
 DEFAULT_UA     = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/120.0.0.0 Safari/537.36")
@@ -195,7 +196,7 @@ class RateLimitedSession(requests.Session):
         with RateLimitedSession._lock:
             wait = RateLimitedSession._backoff_until - time.time()
         if wait > 0:
-            time.sleep(min(wait, 60))
+            time.sleep(min(wait, 120))
 
         try:
             resp = super().request(method, url, **kwargs)
@@ -203,13 +204,32 @@ class RateLimitedSession(requests.Session):
             raise
 
         if resp.status_code in (429, 503):
+            # Prefer the server-stated Retry-After (seconds or HTTP-date) when present;
+            # fall back to exponential backoff otherwise.
+            retry_after = None
+            ra_raw = resp.headers.get("Retry-After")
+            if ra_raw:
+                ra_raw = ra_raw.strip()
+                if ra_raw.isdigit():
+                    retry_after = int(ra_raw)
+                else:
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        dt = parsedate_to_datetime(ra_raw)
+                        retry_after = max(0, (dt.timestamp() - time.time()))
+                    except Exception:
+                        retry_after = None
             with RateLimitedSession._lock:
                 RateLimitedSession._consecutive_429 += 1
-                backoff = min(2 ** RateLimitedSession._consecutive_429, 60)
+                expo = min(2 ** RateLimitedSession._consecutive_429, 60)
+                # Cap a server-requested wait at 120s so a hostile/broken header
+                # can't stall the whole scan indefinitely.
+                backoff = min(retry_after, 120) if retry_after is not None else expo
                 RateLimitedSession._backoff_until = time.time() + backoff
                 if not RateLimitedSession._announced_backoff:
+                    src = "Retry-After" if retry_after is not None else "exponential"
                     print(f"  {Fore.YELLOW}⏱ Rate limited (HTTP {resp.status_code}) "
-                          f"— backing off {backoff}s")
+                          f"— backing off {backoff:.0f}s ({src})")
                     RateLimitedSession._announced_backoff = True
         elif resp.status_code < 400:
             with RateLimitedSession._lock:
@@ -2253,22 +2273,64 @@ def phase_open_redirect(target: str, cfg: ScanConfig, out: str, st: ScanState):
         params = list(set(params + [p for p in DISCOVERED.params
                                      if any(k in p.lower() for k in
                                             ('redirect', 'url', 'return', 'next', 'goto'))]))
-    canary = "https://evil.com/openredirect-canary"
+
+    host = target.split(':')[0]
+    canary_host = "webrecon-oredir.evil.com"
+    # A spread of payloads covering the filters that actually get bypassed:
+    #   plain, scheme-relative, slash-less, backslash, and allowlist-bypass forms
+    # that embed the real host to defeat "must contain our domain" checks.
+    payloads = [
+        f"https://{canary_host}/",       # plain absolute
+        f"//{canary_host}/",             # scheme-relative
+        f"https:{canary_host}/",         # slash-less (browsers still honour)
+        f"/\\{canary_host}/",            # backslash confusion
+        f"https://{host}.{canary_host}/",        # subdomain-of-canary (prefix allowlist bypass)
+        f"https://{canary_host}/{host}",         # path contains target (substring allowlist bypass)
+        f"https://{canary_host}?{host}",         # query contains target
+        f"https://{canary_host}@{host}/",        # userinfo trick (points at target, but flags parsing)
+    ]
+
+    def _redirects_offsite(resp) -> Optional[str]:
+        """Return the offsite location if the response redirects (header OR
+        meta-refresh OR JS) to the canary host; else None."""
+        loc = resp.headers.get("Location", "")
+        if canary_host in loc:
+            return f"Location header → {loc}"
+        body = resp.text[:8000]
+        # <meta http-equiv="refresh" content="0;url=...canary...">
+        if re.search(rf'(?i)http-equiv=["\']?refresh["\']?[^>]*{re.escape(canary_host)}', body):
+            m = re.search(rf'(?i)url=([^"\'>\s]*{re.escape(canary_host)}[^"\'>\s]*)', body)
+            return f"meta-refresh → {m.group(1) if m else canary_host}"
+        # window.location / location.href / location.replace('...canary...')
+        if re.search(rf'(?i)(location\.(href|replace)|window\.location)\s*[=(]\s*["\'][^"\']*{re.escape(canary_host)}', body):
+            return "JS redirect (window.location / location.href)"
+        return None
+
     sess = make_session(cfg)
+    reported: Set[str] = set()   # one finding per param
     for param in params:
-        try:
-            r = sess.get(f"{cfg.base_url}?{param}={canary}",
-                         timeout=cfg.timeout, allow_redirects=False)
-            if "evil.com" in r.headers.get("Location", ""):
-                add_finding(Finding(
-                    title=f"Open Redirect: `{param}` parameter",
-                    severity=Severity.MEDIUM,
-                    description=f"Parameter `{param}` reflects external URL in Location header.",
-                    evidence=f"URL: {cfg.base_url}?{param}={canary}\nLocation: {r.headers.get('Location')}",
-                    recommendation="Validate redirect targets against an allowlist of permitted domains.",
-                    phase=phase), out, cfg)
-        except Exception:
+        if param in reported:
             continue
+        for pl in payloads:
+            try:
+                r = sess.get(f"{cfg.base_url}?{quote(param, safe='')}={quote(pl, safe='')}",
+                             timeout=cfg.timeout, allow_redirects=False)
+                hit = _redirects_offsite(r)
+                if hit:
+                    reported.add(param)
+                    add_finding(Finding(
+                        title=f"Open Redirect: `{param}` parameter",
+                        severity=Severity.MEDIUM,
+                        description=(f"Parameter `{param}` redirects to an attacker-controlled host. "
+                                     f"Bypass class: `{pl}`."),
+                        evidence=f"URL: {cfg.base_url}?{param}={pl}\n{hit}",
+                        recommendation=("Validate redirect targets against an allowlist of permitted hosts. "
+                                        "Reject scheme-relative (//), backslash, and userinfo (@) forms; "
+                                        "compare the parsed host, not a substring match."),
+                        phase=phase), out, cfg)
+                    break
+            except Exception:
+                continue
     st.mark(phase)
 
 
@@ -2524,6 +2586,16 @@ def phase_default_creds(target: str, cfg: ScanConfig, out: str, st: ScanState):
     phase = "default_creds"
     if st.done(phase): return
     section("Default Credential Testing", out)
+
+    # This phase SUBMITS live credentials to real login endpoints, which can
+    # trigger account lockouts, WAF blocks and SOC alerts. Treat it like every
+    # other aggressive check in this tool and gate it behind intrusive mode.
+    if cfg.no_intrusive:
+        _log(out, "> Default-credential testing skipped (--no-intrusive). "
+                  "It submits live logins (lockout/alert risk); re-run without "
+                  "--no-intrusive to enable.")
+        print(f"  {Fore.YELLOW}⚠ Default-cred testing skipped (--no-intrusive — avoids lockouts)")
+        st.mark(phase); return
 
     # (indicator_path, login_path, auth_type, user_field, pass_field, user, pwd, success_text, failure_text)
     PLATFORMS = [
@@ -3249,6 +3321,134 @@ def phase_csp_analysis(target: str, cfg: ScanConfig, out: str, st: ScanState):
     st.mark(phase)
 
 # ═════════════════════════════════════════════════════════════════════════════
+# PHASE 4+ — CSRF TOKEN PRESENCE  (form-based, non-intrusive, read-only)
+# Regex-parses <form> blocks (no bs4 dependency). Flags state-changing (POST)
+# forms that carry no recognizable anti-CSRF token field. Confidence is raised
+# when the session cookie also lacks SameSite (the browser-side CSRF defence).
+# Reported MEDIUM as a defence-in-depth finding requiring manual confirmation.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Common hidden-field / header names used for CSRF/XSRF protection.
+_CSRF_TOKEN_HINTS = [
+    "csrf", "xsrf", "authenticity_token", "__requestverificationtoken",
+    "_token", "csrfmiddlewaretoken", "csrf_token", "csrftoken", "nonce",
+    "anticsrf", "__csrf", "requestverificationtoken", "form_token", "_csrf",
+]
+
+def _form_has_csrf_token(form_html: str) -> bool:
+    """True if any input/name/id inside the form looks like a CSRF token, or a
+    high-entropy hidden value is present (some frameworks use random field names)."""
+    fl = form_html.lower()
+    if any(h in fl for h in _CSRF_TOKEN_HINTS):
+        return True
+    # Hidden input with a long, token-shaped value (>=24 chars, mixed) — heuristic
+    for m in re.finditer(r'<input[^>]*type=["\']?hidden["\']?[^>]*>', form_html, re.I):
+        val = re.search(r'value=["\']([^"\']{24,})["\']', m.group(0), re.I)
+        if val and re.search(r'[0-9]', val.group(1)) and re.search(r'[a-zA-Z]', val.group(1)):
+            return True
+    return False
+
+def phase_csrf(target: str, cfg: ScanConfig, out: str, st: ScanState):
+    phase = "csrf"
+    if st.done(phase): return
+    section("CSRF Token Presence (forms)", out)
+    sess = make_session(cfg)
+
+    # Session cookies lacking SameSite make CSRF materially easier — establish
+    # that context once so we can sharpen each per-form finding.
+    samesite_gap = False
+    try:
+        r0 = sess.get(cfg.base_url, timeout=cfg.timeout)
+        for c in r0.cookies:
+            ss = (c.get_nonstandard_attr('SameSite') or
+                  c.get_nonstandard_attr('samesite') or '')
+            if not ss:
+                samesite_gap = True
+                break
+    except Exception:
+        pass
+
+    # Gather candidate HTML pages: base URL + a handful of discovered same-host
+    # endpoints that are likely to render forms (login/account/settings/etc.).
+    pages = [cfg.base_url]
+    with DISCOVERED._lock:
+        for u in list(DISCOVERED.urls):
+            if any(k in u.lower() for k in
+                   ('login', 'signin', 'register', 'account', 'settings',
+                    'profile', 'password', 'contact', 'checkout', 'transfer')):
+                pages.append(u)
+    # De-dup, keep it bounded
+    seen, page_list = set(), []
+    for u in pages:
+        if u not in seen:
+            seen.add(u); page_list.append(u)
+    page_list = page_list[:15]
+
+    base_host = urlparse(cfg.base_url).netloc.lower()
+    flagged = 0
+    reported_actions: Set[str] = set()
+
+    for page in page_list:
+        try:
+            r = sess.get(page, timeout=cfg.timeout)
+            if r.status_code != 200 or 'html' not in r.headers.get('Content-Type', '').lower():
+                continue
+            if looks_like_catchall(cfg, r.text, len(r.content)):
+                continue
+            for fm in re.finditer(r'<form\b[^>]*>.*?</form>', r.text, re.I | re.S):
+                form_html = fm.group(0)
+                head = re.search(r'<form\b[^>]*>', form_html, re.I)
+                head_txt = head.group(0) if head else ''
+                method = 'get'
+                mm = re.search(r'method=["\']?(\w+)', head_txt, re.I)
+                if mm:
+                    method = mm.group(1).lower()
+                # Only state-changing forms matter for CSRF.
+                if method != 'post':
+                    continue
+                # Resolve the action; only report same-origin submissions.
+                am = re.search(r'action=["\']([^"\']*)["\']', head_txt, re.I)
+                action = am.group(1) if am else page
+                action_abs = urljoin(page, action) if action else page
+                if urlparse(action_abs).netloc and urlparse(action_abs).netloc.lower() != base_host:
+                    continue  # cross-origin POST target — out of our concern
+                if _form_has_csrf_token(form_html):
+                    continue
+                # Skip pure search forms (common false positive: search has no CSRF need).
+                if re.search(r'name=["\']?(q|query|search|s|keyword)["\']?', form_html, re.I) \
+                        and not re.search(r'type=["\']?password', form_html, re.I):
+                    continue
+                key = f"{action_abs}"
+                if key in reported_actions:
+                    continue
+                reported_actions.add(key)
+                flagged += 1
+                sev = Severity.MEDIUM
+                extra = (" Session cookie lacks SameSite, so browsers will attach it "
+                         "on cross-site requests — increasing exploitability."
+                         if samesite_gap else
+                         " (Session cookie SameSite may still provide partial protection — confirm.)")
+                add_finding(Finding(
+                    title=f"POST Form Without CSRF Token: {urlparse(action_abs).path or '/'}",
+                    severity=sev,
+                    description=(f"A state-changing POST form on `{page}` submits to "
+                                 f"`{action_abs}` with no recognizable anti-CSRF token field."
+                                 + extra +
+                                 " Manually confirm the endpoint is not otherwise protected "
+                                 "(custom header requirement, double-submit cookie, origin check)."),
+                    evidence=f"Page: {page}\nForm action: {action_abs}\nForm head: {head_txt[:200]}",
+                    recommendation=("Add a per-session/per-request anti-CSRF token to state-changing "
+                                    "forms and verify it server-side. Set SameSite=Lax/Strict on session "
+                                    "cookies as defence-in-depth."),
+                    phase=phase), out, cfg)
+        except Exception:
+            continue
+
+    if flagged == 0:
+        _log(out, "> No unprotected state-changing POST forms found (or all carried tokens).")
+    st.mark(phase)
+
+# ═════════════════════════════════════════════════════════════════════════════
 # PHASE 5+ — REFLECTED INPUT / XSS CONTEXT PROBE  (safe, non-executing)
 # Injects a unique alphanumeric marker plus the raw chars " ' < > to see which
 # survive unencoded, and in what context. It NEVER injects an executable
@@ -3287,7 +3487,11 @@ def phase_reflection_xss(target: str, cfg: ScanConfig, out: str, st: ScanState):
                 if pname in reported_params:
                     continue
                 newqs = {k: (probe if k == pname else v[0]) for k, v in qs.items()}
-                query = '&'.join(f"{k}={v}" for k, v in newqs.items())
+                # Encode values so they reach the server intact; the server decodes
+                # them back to the raw chars, so an unescaped reflection is still
+                # detectable — while other params with &/spaces no longer corrupt
+                # the query. safe="<>\"'" keeps the probe chars readable in evidence.
+                query = '&'.join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in newqs.items())
                 test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{query}"
                 r = sess.get(test_url, timeout=cfg.timeout)
                 tested += 1
@@ -3392,8 +3596,11 @@ def phase_sqli(target: str, cfg: ScanConfig, out: str, st: ScanState):
             orig = pvals[0] if pvals else "1"
 
             def build(value: str) -> str:
+                # Percent-encode every value so payloads containing spaces/quotes
+                # reach the server intact instead of being mangled or rejected
+                # (raw concatenation was a silent source of false negatives).
                 nq = {k: (value if k == pname else v[0]) for k, v in qs.items()}
-                q = '&'.join(f"{k}={v}" for k, v in nq.items())
+                q = '&'.join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in nq.items())
                 return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{q}"
 
             # ── Error-based ──
@@ -3414,25 +3621,36 @@ def phase_sqli(target: str, cfg: ScanConfig, out: str, st: ScanState):
             # ── Boolean-based differential ──
             try:
                 base = sess.get(build(orig), timeout=cfg.timeout)
-                true_url  = build(f"{orig}' AND '1'='1")
-                false_url = build(f"{orig}' AND '1'='2")
-                tr = sess.get(true_url, timeout=cfg.timeout)
-                fr = sess.get(false_url, timeout=cfg.timeout)
-                lt, lf, lb = len(tr.text), len(fr.text), len(base.text)
-                # TRUE should resemble baseline; FALSE should differ markedly
-                true_like_base = abs(lt - lb) < max(40, lb * 0.02)
-                false_differs  = abs(lf - lt) > max(60, lt * 0.05)
-                if tr.status_code == fr.status_code == 200 and true_like_base and false_differs:
-                    add_finding(Finding(
-                        title=f"SQL Injection (boolean-based) via `{pname}`",
-                        severity=Severity.HIGH,
-                        description=(f"Parameter `{pname}` shows boolean-differential behaviour: the TRUE "
-                                     f"condition matches the baseline page while the FALSE condition diverges."),
-                        evidence=(f"baseline={lb}B  TRUE(1=1)={lt}B  FALSE(1=2)={lf}B\n"
-                                  f"TRUE:  {true_url}\nFALSE: {false_url}"),
-                        recommendation="Use parameterised queries. Validate/whitelist input types.",
-                        phase=phase), out, cfg)
-                    continue
+                # Stability guard: fetch the SAME baseline a second time. If the
+                # page isn't stable (rotating CSRF token, timestamp, ad slot, etc.)
+                # length-based boolean inference is unreliable — skip it to avoid
+                # false positives.
+                base2 = sess.get(build(orig), timeout=cfg.timeout)
+                lb, lb2 = len(base.text), len(base2.text)
+                page_stable = abs(lb - lb2) < max(40, lb * 0.02)
+                if not page_stable:
+                    _log(out, f"> `{pname}`: baseline unstable "
+                              f"({lb}B vs {lb2}B) — skipping boolean-based SQLi to avoid FP.")
+                else:
+                    true_url  = build(f"{orig}' AND '1'='1")
+                    false_url = build(f"{orig}' AND '1'='2")
+                    tr = sess.get(true_url, timeout=cfg.timeout)
+                    fr = sess.get(false_url, timeout=cfg.timeout)
+                    lt, lf = len(tr.text), len(fr.text)
+                    # TRUE should resemble baseline; FALSE should differ markedly
+                    true_like_base = abs(lt - lb) < max(40, lb * 0.02)
+                    false_differs  = abs(lf - lt) > max(60, lt * 0.05)
+                    if tr.status_code == fr.status_code == 200 and true_like_base and false_differs:
+                        add_finding(Finding(
+                            title=f"SQL Injection (boolean-based) via `{pname}`",
+                            severity=Severity.HIGH,
+                            description=(f"Parameter `{pname}` shows boolean-differential behaviour: the TRUE "
+                                         f"condition matches the baseline page while the FALSE condition diverges."),
+                            evidence=(f"baseline={lb}B  TRUE(1=1)={lt}B  FALSE(1=2)={lf}B\n"
+                                      f"TRUE:  {true_url}\nFALSE: {false_url}"),
+                            recommendation="Use parameterised queries. Validate/whitelist input types.",
+                            phase=phase), out, cfg)
+                        continue
             except Exception:
                 pass
 
@@ -4243,6 +4461,7 @@ def run_single_target(args, target, tt, scope, output_prefix):
 
             phase_host_header(target, cfg, out, state)
             phase_crlf(target, cfg, out, state)
+            phase_csrf(target, cfg, out, state)
             phase_jwt_analysis(target, cfg, out, state)
             phase_http_methods(target, cfg, out, state)
             phase_403_bypass(target, cfg, out, state)
