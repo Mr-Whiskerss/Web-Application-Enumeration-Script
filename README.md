@@ -2,7 +2,7 @@
 
 **Comprehensive Web Application Reconnaissance & Enumeration**
 
-A single-file Python framework that orchestrates passive OSINT, active reconnaissance, content discovery, first-party vulnerability probing, and reporting for web-application penetration testing.
+A modular Python framework that orchestrates passive OSINT, active reconnaissance, content discovery, vulnerability probing, and reporting for web-application penetration testing.
 
 WebRecon glues together the tools you already use — `nuclei`, `katana`, `arjun`, `ffuf`, `nmap`, `wpscan`, `wafw00f`, `subfinder` and friends — and adds its own checks for the gaps those tools leave, feeding everything into a shared discovery state so injection phases test the *real* attack surface rather than a fixed wordlist.
 
@@ -11,7 +11,7 @@ WebRecon glues together the tools you already use — `nuclei`, `katana`, `arjun
 ## Contents
 
 - [Highlights](#highlights)
-- [What's new in 3.3.0](#whats-new-in-330)
+- [Architecture](#architecture)
 - [Capabilities](#capabilities)
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -22,6 +22,7 @@ WebRecon glues together the tools you already use — `nuclei`, `katana`, `arjun
 - [Output](#output)
 - [Integrations](#integrations)
 - [Resume & diff](#resume--diff)
+- [Development & Testing](#development--testing)
 - [Design principles](#design-principles)
 - [Responsible use](#responsible-use)
 - [License](#license)
@@ -35,18 +36,72 @@ WebRecon glues together the tools you already use — `nuclei`, `katana`, `arjun
 - **Safe by default** — aggressive checks (time-based SQLi, request smuggling, default-credential submission) are gated behind `--no-intrusive`.
 - **Resumable & batch-capable** — target-aware state file, `--resume`, and `-iL` list scanning with per-target outputs.
 - **Reports you can hand over** — filterable dark-themed HTML, Markdown, and structured JSON suitable for import pipelines.
+- **Professional modular architecture** — clean separation of concerns with 23+ modules for easy extension, maintenance, and testing.
 
-## What's new in 3.3.0
+## Architecture
 
-| Change | Type | Detail |
-|---|---|---|
-| **CSRF token detection** | New phase | Parses `<form>` blocks and flags same-origin **POST** forms carrying no recognizable anti-CSRF token; sharpens severity when session cookies also lack `SameSite`. Skips search forms to stay low-FP. |
-| **SQLi payload encoding** | Fix (false negatives) | Injection values are now percent-encoded so payloads with spaces/quotes reach the server intact instead of being mangled or rejected. |
-| **SQLi stability guard** | Fix (false positives) | Boolean-based detection now verifies the page is stable across two identical baseline requests before trusting length deltas — avoids firing on rotating tokens/timestamps/ads. |
-| **Reflected-XSS transit** | Fix (false negatives) | Probe query values are encoded correctly so other parameters no longer corrupt the request and the probe reliably arrives. |
-| **Open redirect coverage** | Enhancement | Adds scheme-relative (`//`), slash-less, backslash and allowlist-bypass payloads, plus body-based detection of `meta-refresh` and `window.location` redirects (not just the `Location` header). |
-| **Default-credential gating** | Safety | Live credential submission (lockout/alert risk) is now behind `--no-intrusive`, consistent with the rest of the tool. |
-| **`Retry-After` support** | Enhancement | The adaptive rate limiter honours a server-stated `Retry-After` (seconds or HTTP-date, capped at 120s) instead of a blind exponential curve. |
+WebRecon is built on a professional modular architecture with clear separation of concerns:
+
+```
+web_app/
+├── core/                    # Core functionality
+│   ├── session.py          # RateLimitedSession, adaptive backoff, 429/503 handling
+│   ├── state.py            # ScanState, ScopeChecker, DiscoveredState
+│   ├── findings.py         # Finding dataclass, severity, deduplication
+│   ├── config.py           # ConfigManager, YAML parsing, env var expansion
+│   └── discovery.py        # Shared discovery state (URLs, params, endpoints)
+│
+├── phases/                  # 47 scanning phase functions (9 modules)
+│   ├── passive.py          # DNS, certs, Wayback, Google dorks, email, subdomains, favicon, DNS security
+│   ├── active.py           # Port scanning, WAF/CDN detection, vhost fuzzing
+│   ├── discovery.py        # Tech detection, playbooks, robots, crawler, content/param discovery, API schema, source exposure
+│   ├── http_analysis.py    # Headers, CORS, OAuth/OIDC, CSP, host header, CRLF, CSRF, JWT
+│   ├── vulns.py            # SSL/TLS, Nikto, Nuclei, JS analysis, GraphQL, traversal, open redirect, SSRF, SSTI, XXE, default creds, cloud buckets, WebSockets, prototype pollution, screenshots
+│   ├── http_methods.py     # HTTP methods, 403 bypass, request smuggling
+│   ├── reflection_xss.py   # Reflected input and XSS context analysis
+│   ├── sqli.py             # SQL injection detection (error, boolean, time-based)
+│   └── dns_security.py     # SPF, DMARC, DNSSEC, CAA, AXFR validation
+│
+├── integrations/            # Third-party integrations
+│   ├── webhook.py          # Discord/Slack webhook notifications
+│   └── pentestdb.py        # PentestDB API integration
+│
+├── reporting/               # Finding export formats
+│   ├── markdown.py         # Markdown report generation
+│   ├── html.py             # Interactive HTML reports with filtering/search
+│   └── json.py             # JSON export and finding diffing
+│
+├── utils/                   # Utilities and helpers
+│   ├── subprocess_runner.py # Safe command execution with error handling
+│   ├── tool_check.py       # Tool availability and permission checking
+│   ├── output.py           # Thread-safe logging and formatting
+│   └── helpers.py          # General utilities (validation, sanitization, normalization)
+│
+├── main.py                  # Orchestrator: coordinates all modules
+├── config.py               # Legacy entry point (imports from main.py)
+└── web_app.py              # CLI entry point (imports from main.py)
+
+tests/                       # Comprehensive test suite (350+ tests)
+├── test_core/              # Core module tests (170 tests)
+├── test_utils/             # Utility module tests (138 tests)
+├── test_reporting/         # Reporting module tests (24 tests)
+├── conftest.py             # Pytest fixtures and configuration
+└── (integration & phase tests)
+
+configs/                     # Configuration profiles
+├── config.example.yaml     # Full configuration template
+├── config.aggressive.yaml  # Fast profile (threads: 10, rate: 100)
+├── config.stealth.yaml     # Slow profile (threads: 2, rate: 10)
+└── config.minimal.yaml     # Bare essentials
+```
+
+**Key architectural features:**
+- **Thread-safe operations** — locks for concurrent logging and state management
+- **Resumable scans** — atomic state persistence with per-target tracking
+- **Deduplication** — MD5 hashing of (title|severity|evidence) prevents duplicate findings
+- **Adaptive rate limiting** — exponential backoff for 429/503 with Retry-After header support
+- **Configuration hierarchy** — CLI > explicit config > project config > user config > defaults
+- **Comprehensive logging** — custom exception types with structured logging
 
 ## Capabilities
 
@@ -60,7 +115,7 @@ Port scanning (nmap), WAF/CDN detection, virtual-host fuzzing.
 Tech fingerprinting with tech-specific playbooks (WordPress, Drupal, Joomla, Laravel, Spring Boot, Tomcat, Jenkins, ASP.NET/IIS), robots/sitemap/security.txt, katana crawling, OpenAPI/Swagger/WSDL schema mining, VCS/source exposure (`.git`, `.svn`, `.env`, backups), directory & hidden-parameter discovery.
 
 **HTTP analysis**
-Security-header & cookie audit, CORS misconfiguration, OAuth/OIDC enumeration, deep CSP analysis, host-header injection, CRLF injection, **CSRF token presence**, JWT deep analysis (`alg:none`, weak-HMAC cracking, `kid` injection, lifetime), HTTP verb tampering, 401/403 bypass.
+Security-header & cookie audit, CORS misconfiguration, OAuth/OIDC enumeration, deep CSP analysis, host-header injection, CRLF injection, CSRF token presence, JWT deep analysis (`alg:none`, weak-HMAC cracking, `kid` injection, lifetime), HTTP verb tampering, 401/403 bypass.
 
 **Vulnerability probing**
 SSL/TLS, Nikto, nuclei, JavaScript secret extraction, GraphQL, path traversal, open redirect, reflected-input/XSS context analysis, differential SQLi (error / boolean / time-based), SSRF (OOB + cloud-metadata), differential SSTI, XXE (classic + blind + SOAP + SVG), default credentials, HTTP request smuggling (CL.TE / TE.CL timing), WebSocket discovery, prototype pollution.
@@ -70,19 +125,27 @@ Cloud storage bucket checks, screenshotting.
 
 ## Installation
 
-WebRecon is a single script. Clone the repo and install the Python dependencies:
+WebRecon is modular Python framework. Clone the repo and install the Python dependencies:
 
 ```bash
 git clone https://github.com/Mr-Whiskerss/Web-Application-Enumeration-Script.git
 cd Web-Application-Enumeration-Script
-pip install requests colorama
+pip install -r requirements.txt
 chmod +x web_app.py
 ```
 
-**Optional Python package** — enables favicon-hash pivoting:
+**Development & testing** — install dev dependencies:
 
 ```bash
-pip install mmh3
+pip install -r requirements-dev.txt
+pytest tests/ -v  # Run test suite (350+ tests)
+```
+
+**Optional Python packages**:
+
+```bash
+pip install mmh3          # Favicon-hash pivoting
+pip install pyyaml        # YAML config support (in requirements.txt)
 ```
 
 ### External tools
@@ -193,6 +256,13 @@ On Kali/ParrotOS most of these are already present or one `apt`/`pipx` away.
 | `--resume` | Resume an interrupted scan |
 | `--fresh` | Clear state and start fresh |
 
+**Configuration**
+
+| Flag | Description |
+|---|---|
+| `-C, --config` | YAML config file (overrides defaults, CLI args take precedence) |
+| `--show-config` | Display merged configuration and exit |
+
 **Integrations & reporting**
 
 | Flag | Description |
@@ -250,7 +320,7 @@ Each target produces a set of files under the chosen prefix:
 | File | Contents |
 |---|---|
 | `<prefix>.md` | Full Markdown report with per-phase logs |
-| `<prefix>.report.html` | Filterable, dark-themed HTML report |
+| `<prefix>.report.html` | Filterable, dark-themed HTML report with search & severity filtering |
 | `<prefix>.findings.json` | Structured findings for import/diffing |
 | `<prefix>.state.json` | Scan state for `--resume` |
 
@@ -284,6 +354,44 @@ The run ends with a severity summary and a **tool-availability report** that exp
 ./web_app.py -t example.com --auto --diff example.findings.json
 ```
 
+## Development & Testing
+
+WebRecon includes a comprehensive test suite with 350+ tests across all modules:
+
+```bash
+# Install dev dependencies
+pip install -r requirements-dev.txt
+
+# Run all tests
+pytest tests/ -v
+
+# Run with coverage report
+pytest tests/ --cov=web_app --cov-report=html
+
+# Run specific test module
+pytest tests/test_core/test_findings.py -v
+
+# Run tests in parallel
+pytest tests/ -n auto
+```
+
+**Test structure:**
+- `tests/test_core/` — 170 tests for core modules (config, findings, state, session, discovery)
+- `tests/test_utils/` — 138 tests for utility modules (helpers, subprocess, tool_check, output)
+- `tests/test_reporting/` — 24 tests for reporting formats (markdown, html, json)
+- `tests/test_integrations.py` — 24 tests for webhooks and PentestDB
+- `tests/test_phases_sample.py` — 14 tests for sample phases
+
+All tests use mocking to avoid external dependencies and execute in <5 seconds.
+
+**Extending WebRecon:**
+1. Add a new phase function in `web_app/phases/<phase_type>.py`
+2. Import it in `web_app/main.py` and call it in the phase execution loop
+3. Add unit tests in `tests/test_phases/test_<name>.py`
+4. Run `pytest` to verify
+
+See [TESTING.md](TESTING.md) for detailed testing guide.
+
 ## Design principles
 
 - **Discovery feeds injection.** No phase tests in isolation; crawled and mined URLs/params drive the vulnerability phases.
@@ -291,6 +399,7 @@ The run ends with a severity summary and a **tool-availability report** that exp
 - **Aggressive is opt-in.** Anything that could cause lockouts, desync, or side effects sits behind `--no-intrusive`.
 - **Graceful degradation.** Missing an external tool skips a phase and is reported — it never crashes the run.
 - **Reproducible.** State files, resume, and diff mode make repeat assessments comparable.
+- **Modular & maintainable.** Clean architecture with 23+ modules, comprehensive test coverage, and clear separation of concerns.
 
 ## Responsible use
 
@@ -301,3 +410,5 @@ WebRecon sends live, and in intrusive mode aggressive, traffic to its targets. O
 Released under the **GPL-3.0** license.
 
 > Project: <https://github.com/Mr-Whiskerss/Web-Application-Enumeration-Script>
+>
+> Built with modular architecture, comprehensive configuration system, structured error handling, and 350+ unit tests. Designed for professional penetration testing workflows.
