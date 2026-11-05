@@ -6,4 +6,6 @@ External service integrations:
 - pentestdb: PentestDB backend storage
 """
 
-__all__ = []
+from .pentestdb import pentestdb_push
+
+__all__ = ["pentestdb_push"]
