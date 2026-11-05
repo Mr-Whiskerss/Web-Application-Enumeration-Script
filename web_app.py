@@ -113,6 +113,13 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
 logger = None  # Set in main()
 
+# ── Config module ─────────────────────────────────────────────────────────────
+try:
+    from config import ConfigManager, print_config, validate_config
+    HAS_CONFIG = True
+except ImportError:
+    HAS_CONFIG = False
+
 # ── Dependency checks ────────────────────────────────────────────────────────
 _MISSING = []
 try:
@@ -4338,15 +4345,22 @@ def parse_args():
         epilog="""
 Examples:
   web_app.py -t example.com
+  web_app.py -t example.com -C configs/config.aggressive.yaml
   web_app.py -t example.com --proxy http://127.0.0.1:8080 --oob-url xxx.oast.live
   web_app.py -t example.com --cookie "session=abc123" --auth-check-url https://example.com/profile --auth-check-text "Logout"
-  web_app.py -t example.com --profile recon
-  web_app.py -t example.com --profile stealth --nuclei-severity high,critical
-  web_app.py -t example.com --auto --diff previous.findings.json
-  web_app.py -t example.com --webhook-url https://discord.com/api/webhooks/... --pentestdb-url http://pi:5000
-  web_app.py -t example.com --resume
+  web_app.py -t example.com --profile stealth
+  web_app.py -t example.com --profile aggressive --nuclei-severity high,critical
+  web_app.py -t example.com --show-config
   web_app.py -iL targets.txt --auto --profile stealth
         """)
+
+    # ── Configuration ──────────────────────────────────────────────────
+    p.add_argument("-C", "--config",        dest="config_file",
+                   help="Config file (YAML). Searches ~/.webrecon-config.yaml and ./webrecon-config.yaml by default.")
+    p.add_argument("--show-config",         action="store_true",
+                   help="Display effective configuration and exit (after loading from files/args)")
+
+    # ── Target ─────────────────────────────────────────────────────────
     p.add_argument("-t", "--target",        help="Target domain or IP (host:port also accepted)")
     p.add_argument("-o", "--output",        default="webrecon", help="Output file prefix")
     p.add_argument("-iL", "--target-list",  dest="target_list",
@@ -4486,6 +4500,30 @@ def main():
     logger = setup_logging(verbose=args.verbose)
     logger.info(f"WebRecon v{VERSION} starting")
 
+    # Initialize config manager
+    if HAS_CONFIG:
+        try:
+            cfg_mgr = ConfigManager(explicit_config=args.config_file, verbose=args.verbose)
+            validate_config(cfg_mgr)
+            if args.verbose:
+                logger.debug("Configuration loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize config: {e}")
+            cfg_mgr = None
+    else:
+        if args.config_file:
+            print(f"{Fore.YELLOW}  ⚠ Config file support requires PyYAML. Install with: pip install PyYAML")
+        cfg_mgr = None
+
+    # Show config and exit if requested
+    if args.show_config:
+        print(f"\n{Fore.CYAN}Effective Configuration:\n")
+        if cfg_mgr:
+            print_config(cfg_mgr.to_dict())
+        else:
+            print("No configuration loaded (PyYAML not installed)")
+        sys.exit(0)
+
     print(f"\n{Fore.MAGENTA}{'═'*60}")
     print(f"{Fore.MAGENTA}  WebRecon v{VERSION}")
     print(f"{Fore.MAGENTA}{'═'*60}\n")
@@ -4527,7 +4565,7 @@ def main():
             print(f"{Fore.MAGENTA}{'━'*60}")
         prefix = _target_prefix(args.output, t, batch)
         try:
-            counts = run_single_target(args, t, tt, scope, prefix)
+            counts = run_single_target(args, t, tt, scope, prefix, cfg_mgr)
             results.append((t, prefix, counts))
         except KeyboardInterrupt:
             print(f"\n{Fore.YELLOW}  Batch interrupted — stopping after {idx} target(s). "
@@ -4544,8 +4582,17 @@ def main():
         _print_batch_summary(results, batch_start)
 
 
-def run_single_target(args, target, tt, scope, output_prefix):
-    """Run a complete scan against one target. Returns a severity Counter."""
+def run_single_target(args, target, tt, scope, output_prefix, cfg_mgr=None):
+    """Run a complete scan against one target. Returns a severity Counter.
+
+    Args:
+        args: Parsed command-line arguments
+        target: Target domain/IP
+        tt: TargetType enum
+        scope: ScopeChecker instance
+        output_prefix: Prefix for output files
+        cfg_mgr: ConfigManager instance (optional)
+    """
     out       = output_prefix + ".md"
     findings  = output_prefix + ".findings.json"
     state_f   = output_prefix + ".state.json"
@@ -4560,12 +4607,26 @@ def run_single_target(args, target, tt, scope, output_prefix):
         state.clear()
         print(f"{Fore.YELLOW}  [FRESH] State cleared.")
 
+    # Get config values with precedence: config file > CLI args > defaults
+    def get_cfg(cli_val, cfg_key, default):
+        """Get config value: CLI > config file > default"""
+        if cli_val is not None and cli_val != default:
+            return cli_val  # CLI arg was explicitly set
+        if cfg_mgr:
+            cfg_val = cfg_mgr.get(cfg_key)
+            if cfg_val is not None:
+                return cfg_val
+        return cli_val if cli_val is not None else default
+
     # Build initial config so detect_scheme uses the auth/proxy settings
     cfg_stub = ScanConfig(
         target=target, target_type=tt, base_url=f"http://{target}",
         output_prefix=output_prefix,
-        proxy=args.proxy, user_agent=args.user_agent, timeout=args.timeout,
-        cookie=args.cookie, extra_headers=args.headers or [],
+        proxy=args.proxy or (cfg_mgr.get("integrations.proxy") if cfg_mgr else None),
+        user_agent=get_cfg(args.user_agent, "scanning.user_agent", DEFAULT_UA),
+        timeout=get_cfg(args.timeout, "scanning.timeout", 10),
+        cookie=args.cookie,
+        extra_headers=args.headers or [],
     )
 
     print(f"\n{Fore.CYAN}  Detecting scheme for {target}…")
@@ -4575,35 +4636,35 @@ def run_single_target(args, target, tt, scope, output_prefix):
         target=target, target_type=tt,
         base_url=f"{scheme}://{target}",
         output_prefix=output_prefix,
-        proxy=args.proxy,
-        user_agent=args.user_agent,
-        timeout=args.timeout,
+        proxy=get_cfg(args.proxy, "scanning.proxy", None),
+        user_agent=get_cfg(args.user_agent, "scanning.user_agent", DEFAULT_UA),
+        timeout=get_cfg(args.timeout, "scanning.timeout", 10),
         oob_url=args.oob_url,
         scope_file=args.scope_file,
         auto=args.auto,
-        rate=args.rate,
-        delay=args.delay,
-        full_ports=args.full_ports,
+        rate=get_cfg(args.rate, "scanning.rate", 50),
+        delay=get_cfg(args.delay, "scanning.delay", 0.0),
+        full_ports=get_cfg(args.full_ports, "scanning.full_ports", False),
         google_api_key=args.google_api_key,
         google_cx=args.google_cx,
         google_dork_count=args.google_dork_count,
         diff_file=args.diff_file,
-        threads=args.threads,
+        threads=get_cfg(args.threads, "scanning.threads", 5),
         verbose=args.verbose,
         cookie=args.cookie,
         extra_headers=args.headers or [],
         auth_check_url=args.auth_check_url,
         auth_check_text=args.auth_check_text,
-        webhook_url=args.webhook_url,
+        webhook_url=args.webhook_url or (cfg_mgr.get("integrations.webhook_url") if cfg_mgr else None),
         webhook_threshold=Severity[args.webhook_threshold],
-        pentestdb_url=args.pentestdb_url,
-        pentestdb_token=args.pentestdb_token,
+        pentestdb_url=args.pentestdb_url or (cfg_mgr.get("integrations.pentestdb_url") if cfg_mgr else None),
+        pentestdb_token=args.pentestdb_token or (cfg_mgr.get("integrations.pentestdb_token") if cfg_mgr else None),
         profile=ScanProfile(args.profile),
         no_intrusive=args.no_intrusive,
         nuclei_severity=args.nuclei_severity,
         html_report=not args.no_html,
-        whatweb_timeout=args.whatweb_timeout,
-        arjun_timeout=args.arjun_timeout,
+        whatweb_timeout=get_cfg(args.whatweb_timeout, "tools.whatweb_timeout", 120),
+        arjun_timeout=get_cfg(args.arjun_timeout, "tools.arjun_timeout", 1200),
     )
     cfg = _apply_profile(args, cfg)
 

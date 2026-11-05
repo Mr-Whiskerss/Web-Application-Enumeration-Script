@@ -1,0 +1,208 @@
+# WebRecon Configuration File (Example)
+#
+# This is a fully commented example showing all available options.
+# Copy this file to ~/.webrecon-config.yaml or ./webrecon-config.yaml
+#
+# Configuration Priority (lowest to highest):
+# 1. Hardcoded defaults in code
+# 2. ~/.webrecon-config.yaml (user global)
+# 3. ./webrecon-config.yaml (project directory)
+# 4. -C/--config flag (explicit file)
+# 5. CLI arguments (highest - always override config)
+#
+# Environment variables are supported: ${HOME}, ${USER}, ${PWD}, etc.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCANNING OPTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+scanning:
+  # Parallel threads for different phases
+  threads: 5
+
+  # HTTP request timeout in seconds
+  timeout: 10
+
+  # Request rate limit (requests per second in ffuf/nuclei)
+  rate: 50
+
+  # Delay between requests (seconds)
+  delay: 0.0
+
+  # Run full port scan (-p-) instead of common ports
+  full_ports: false
+
+  # Verbosity (also controlled by -v flag)
+  verbose: false
+
+  # Wordlist paths (expand with ${HOME}, ${USER}, ${PWD})
+  wordlists:
+    common: /usr/share/seclists/Discovery/Web-Content/common.txt
+    subdomains: /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
+    # admin wordlist is generated on-the-fly if not specified
+    admin: null
+
+  # Common web service ports (for nmap)
+  ports:
+    web: "21,22,23,25,53,80,81,88,110,143,389,443,445,465,587,636,993,995,1080,1443,2049,3000,3306,3389,4443,4848,5000,5432,5900,6379,7001,7443,8000,8080,8081,8443,8444,8888,9000,9090,9200,9443,10000,27017"
+
+  # Common API endpoints to probe
+  api_endpoints:
+    common:
+      - /api/
+      - /api/v1/
+      - /api/v2/
+      - /v1/
+      - /graphql/
+      - /rest/
+
+  # Paths to probe for specific issues
+  paths:
+    vcs:
+      - /.git/
+      - /.svn/
+      - /.hg/
+    config:
+      - /.env
+      - /.env.local
+      - /.htpasswd
+    backup:
+      - /index.php.bak
+      - /web.config.bak
+    admin:
+      - /admin
+      - /administrator
+      - /wp-admin
+      - /cpanel
+      - /phpmyadmin
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEFAULT CREDENTIALS
+# ══════════════════════════════════════════════════════════════════════════════
+credentials:
+  wordpress:
+    - user: admin
+      password: admin
+    - user: admin
+      password: password
+
+  tomcat:
+    - user: tomcat
+      password: tomcat
+    - user: tomcat
+      password: s3cret
+    - user: admin
+      password: admin
+
+  jenkins:
+    - user: admin
+      password: admin
+
+  generic:
+    - user: admin
+      password: admin
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+tools:
+  # Timeouts for specific tools (seconds)
+  nmap_timeout: 600
+  nmap_full_timeout: 2400
+  whatweb_timeout: 120
+  arjun_timeout: 1200
+  nuclei_timeout: 1800
+
+  # Custom tool paths (leave empty to use PATH)
+  tool_paths:
+    nmap: null
+    nuclei: null
+    katana: null
+    ffuf: null
+    # nmap: /custom/path/to/nmap
+
+  # Custom nuclei templates directory
+  nuclei_templates: null
+  # nuclei_templates: ${HOME}/.config/nuclei/templates
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REPORTING OPTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+reporting:
+  # Output format: html, json, markdown
+  format: html
+
+  # Only include findings with these severities
+  include_findings_by_severity:
+    - CRITICAL
+    - HIGH
+    - MEDIUM
+    - LOW
+    - INFO
+
+  # HTML theme: dark or light
+  html_theme: dark
+
+  # Max length of evidence in findings (characters)
+  max_evidence_length: 1500
+
+  # Generate different report formats
+  html_report: true
+  json_report: true
+  markdown_report: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTEGRATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+integrations:
+  # Discord/Slack webhook for findings notifications
+  webhook_url: null
+  # webhook_url: https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+
+  # Minimum severity to send webhook (INFO, LOW, MEDIUM, HIGH, CRITICAL)
+  webhook_threshold: HIGH
+
+  # PentestDB instance for storing findings
+  pentestdb_url: null
+  # pentestdb_url: http://localhost:5000
+
+  # Bearer token for PentestDB API
+  pentestdb_token: null
+  # pentestdb_token: your-api-token-here
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCAN PROFILES
+# ══════════════════════════════════════════════════════════════════════════════
+# Profiles allow you to define preset scanning modes
+# Use: python3 web_app.py -t example.com --profile stealth
+profiles:
+  recon:
+    description: "Passive reconnaissance only - no active probes"
+    threads: 5
+    rate: 50
+    no_intrusive: true
+
+  active:
+    description: "Passive + active recon - no vulnerability scanning"
+    threads: 5
+    rate: 50
+    no_intrusive: true
+
+  full:
+    description: "Complete scan - all phases enabled"
+    threads: 5
+    rate: 50
+    no_intrusive: false
+
+  stealth:
+    description: "Full scan but slow and quiet"
+    threads: 2
+    rate: 10
+    delay: 0.5
+    no_intrusive: true
+
+  aggressive:
+    description: "Fast, intrusive, maximum findings"
+    threads: 10
+    rate: 100
+    delay: 0.0
+    no_intrusive: false

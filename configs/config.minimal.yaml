@@ -1,0 +1,24 @@
+# WebRecon Minimal Configuration
+#
+# Bare essentials - passive recon only, fast, quiet.
+# Perfect for quick reconnaissance without active probing.
+# Use: python3 web_app.py -t example.com -C configs/config.minimal.yaml
+
+scanning:
+  threads: 2
+  timeout: 10
+  rate: 50
+  delay: 0.0
+  full_ports: false
+  verbose: false
+
+tools:
+  nmap_timeout: 300
+  whatweb_timeout: 60
+  arjun_timeout: 300
+
+reporting:
+  format: json
+  include_findings_by_severity: [CRITICAL, HIGH]
+  html_report: false
+  markdown_report: true

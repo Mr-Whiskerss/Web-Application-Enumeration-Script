@@ -1,0 +1,32 @@
+# WebRecon Aggressive Configuration
+#
+# Fast, thorough, intrusive scanning with all features enabled.
+# Use: python3 web_app.py -t example.com -C configs/config.aggressive.yaml
+
+scanning:
+  threads: 10
+  timeout: 10
+  rate: 100
+  delay: 0.0
+  full_ports: false
+  verbose: false
+
+tools:
+  nmap_timeout: 900
+  whatweb_timeout: 180
+  arjun_timeout: 1500
+  nuclei_timeout: 2400
+
+reporting:
+  format: html
+  include_findings_by_severity: [CRITICAL, HIGH, MEDIUM, LOW, INFO]
+  html_theme: dark
+
+# No intrusive checks? Nope - find ALL vulns
+# This profile enables:
+# - Nikto scan
+# - Default credential testing
+# - HTTP PUT/DELETE testing
+# - Time-based SQLi confirmation
+# - Request smuggling probes
+# All other settings use defaults
