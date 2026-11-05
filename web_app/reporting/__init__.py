@@ -7,4 +7,7 @@ Report generation in multiple formats:
 - json: JSON findings export
 """
 
-__all__ = []
+from .html import write_html_report
+from .json import save_findings, diff_findings
+
+__all__ = ["write_html_report", "save_findings", "diff_findings"]
