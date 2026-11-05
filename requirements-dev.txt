@@ -1,0 +1,31 @@
+# Development and testing dependencies
+
+# Core testing framework
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-mock>=3.10.0
+pytest-timeout>=2.1.0
+pytest-xdist>=3.0.0  # For parallel test execution
+
+# Mocking and fixtures
+mock>=4.0.3
+responses>=0.20.0  # Better HTTP mocking
+
+# Code quality
+flake8>=5.0.0
+black>=22.0.0
+isort>=5.11.0
+pylint>=2.15.0
+
+# Type checking
+mypy>=0.990
+
+# Coverage
+coverage[toml]>=6.4.0
+
+# Testing utilities
+faker>=15.0.0  # For generating test data
+hypothesis>=6.0.0  # Property-based testing
+
+# Documentation
+pytest-html>=3.1.0  # HTML test reports

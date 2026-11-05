@@ -1,0 +1,10 @@
+# Development and testing dependencies
+
+# Testing framework
+pytest>=7.0.0
+pytest-mock>=3.10.0
+pytest-cov>=4.0.0
+pytest-timeout>=2.1.0
+
+# Required for main application
+colorama>=0.4.6
