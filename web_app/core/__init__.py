@@ -11,7 +11,7 @@ Core functionality for scanning:
 
 from .session import RateLimitedSession, make_session, detect_scheme, revalidate_session
 from .state import ScanState, ScopeChecker, DiscoveredState
-from .findings import Finding, add_finding, webhook_notify, pentestdb_push, save_findings
+from .findings import Finding, Severity, add_finding, webhook_notify, pentestdb_push, save_findings
 
 __all__ = [
     "RateLimitedSession",
@@ -22,6 +22,7 @@ __all__ = [
     "ScopeChecker",
     "DiscoveredState",
     "Finding",
+    "Severity",
     "add_finding",
     "webhook_notify",
     "pentestdb_push",
