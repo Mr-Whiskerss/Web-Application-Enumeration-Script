@@ -9,10 +9,14 @@ from .helpers import (
     validate,
     sanitise,
     yes_no,
-    _tool_ok,
+    diff_findings,
+)
+from .output import (
+    _log,
+    section,
+    _log_finding_to_report,
+    save_findings,
     run_cmd,
-    detect_catchall,
-    looks_like_catchall,
 )
 
 __all__ = [
@@ -20,8 +24,10 @@ __all__ = [
     "validate",
     "sanitise",
     "yes_no",
-    "_tool_ok",
+    "diff_findings",
+    "_log",
+    "section",
+    "_log_finding_to_report",
+    "save_findings",
     "run_cmd",
-    "detect_catchall",
-    "looks_like_catchall",
 ]
