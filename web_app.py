@@ -59,6 +59,7 @@ import base64
 import subprocess
 import ipaddress
 import threading
+import logging
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -67,6 +68,50 @@ from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, urljoin, parse_qs, quote
 from collections import Counter
+
+# ── Custom Exceptions ────────────────────────────────────────────────────────
+class WebReconException(Exception):
+    """Base exception for WebRecon errors."""
+    pass
+
+class ToolNotFound(WebReconException):
+    """Tool is not installed or not in PATH."""
+    pass
+
+class NetworkError(WebReconException):
+    """Network-related error (connection, timeout, DNS)."""
+    pass
+
+class ParseError(WebReconException):
+    """Error parsing response or data."""
+    pass
+
+class ConfigError(WebReconException):
+    """Configuration error."""
+    pass
+
+# ── Logger Setup ─────────────────────────────────────────────────────────────
+def setup_logging(verbose: bool = False) -> logging.Logger:
+    """Configure logging for the scanner."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logger = logging.getLogger("webrecon")
+    logger.setLevel(level)
+
+    # Console handler
+    handler = logging.StreamHandler()
+    handler.setLevel(level)
+    formatter = logging.Formatter(
+        fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+
+    if not logger.handlers:
+        logger.addHandler(handler)
+
+    return logger
+
+logger = None  # Set in main()
 
 # ── Dependency checks ────────────────────────────────────────────────────────
 _MISSING = []
@@ -192,6 +237,7 @@ class RateLimitedSession(requests.Session):
     _announced_backoff = False
 
     def request(self, method, url, **kwargs):
+        """Make HTTP request with rate-limit handling and backoff."""
         # Respect any active backoff window
         with RateLimitedSession._lock:
             wait = RateLimitedSession._backoff_until - time.time()
@@ -200,14 +246,28 @@ class RateLimitedSession(requests.Session):
 
         try:
             resp = super().request(method, url, **kwargs)
-        except Exception:
-            raise
+        except requests.exceptions.ConnectTimeout:
+            if logger:
+                logger.debug(f"Connection timeout on {method} {url}")
+            raise NetworkError(f"Connection timeout: {url}") from None
+        except requests.exceptions.ReadTimeout:
+            if logger:
+                logger.debug(f"Read timeout on {method} {url}")
+            raise NetworkError(f"Read timeout: {url}") from None
+        except requests.exceptions.ConnectionError as e:
+            if logger:
+                logger.debug(f"Connection error on {method} {url}: {e}")
+            raise NetworkError(f"Connection error: {url}") from e
+        except requests.exceptions.RequestException as e:
+            if logger:
+                logger.debug(f"Request exception on {method} {url}: {e}")
+            raise NetworkError(f"Request failed: {url}") from e
 
+        # Handle rate limiting
         if resp.status_code in (429, 503):
-            # Prefer the server-stated Retry-After (seconds or HTTP-date) when present;
-            # fall back to exponential backoff otherwise.
             retry_after = None
             ra_raw = resp.headers.get("Retry-After")
+
             if ra_raw:
                 ra_raw = ra_raw.strip()
                 if ra_raw.isdigit():
@@ -217,8 +277,11 @@ class RateLimitedSession(requests.Session):
                         from email.utils import parsedate_to_datetime
                         dt = parsedate_to_datetime(ra_raw)
                         retry_after = max(0, (dt.timestamp() - time.time()))
-                    except Exception:
+                    except Exception as e:
+                        if logger:
+                            logger.debug(f"Failed to parse Retry-After header: {e}")
                         retry_after = None
+
             with RateLimitedSession._lock:
                 RateLimitedSession._consecutive_429 += 1
                 expo = min(2 ** RateLimitedSession._consecutive_429, 60)
@@ -226,11 +289,15 @@ class RateLimitedSession(requests.Session):
                 # can't stall the whole scan indefinitely.
                 backoff = min(retry_after, 120) if retry_after is not None else expo
                 RateLimitedSession._backoff_until = time.time() + backoff
+
                 if not RateLimitedSession._announced_backoff:
                     src = "Retry-After" if retry_after is not None else "exponential"
                     print(f"  {Fore.YELLOW}⏱ Rate limited (HTTP {resp.status_code}) "
                           f"— backing off {backoff:.0f}s ({src})")
                     RateLimitedSession._announced_backoff = True
+                    if logger:
+                        logger.warning(f"Rate limited: {resp.status_code}, backing off {backoff:.0f}s")
+
         elif resp.status_code < 400:
             with RateLimitedSession._lock:
                 if RateLimitedSession._consecutive_429 > 0:
@@ -349,32 +416,48 @@ def webhook_notify(f: Finding, cfg: ScanConfig):
     url = cfg.webhook_url
     if not url:
         return
-    # Discord-style embed
-    if "discord" in url.lower():
-        payload = {
-            "embeds": [{
-                "title":       f"[{f.severity.value}] {f.title}",
-                "description": f.description[:1500],
-                "color":       color_map.get(f.severity, 0x95a5a6),
-                "fields": [
-                    {"name": "Target", "value": cfg.target, "inline": True},
-                    {"name": "Phase",  "value": f.phase or "n/a", "inline": True},
-                ],
-                "timestamp": f.timestamp,
-            }]
-        }
-    else:
-        # Slack-style
-        payload = {
-            "text": f"*[{f.severity.value}]* {f.title}\n"
-                    f"_Target:_ `{cfg.target}` | _Phase:_ `{f.phase}`\n"
-                    f"{f.description[:1500]}"
-        }
+
     try:
-        requests.post(url, json=payload, timeout=5, verify=False,
-                      proxies={"http": cfg.proxy, "https": cfg.proxy} if cfg.proxy else None)
-    except Exception:
-        pass
+        # Discord-style embed
+        if "discord" in url.lower():
+            payload = {
+                "embeds": [{
+                    "title":       f"[{f.severity.value}] {f.title}",
+                    "description": f.description[:1500],
+                    "color":       color_map.get(f.severity, 0x95a5a6),
+                    "fields": [
+                        {"name": "Target", "value": cfg.target, "inline": True},
+                        {"name": "Phase",  "value": f.phase or "n/a", "inline": True},
+                    ],
+                    "timestamp": f.timestamp,
+                }]
+            }
+        else:
+            # Slack-style
+            payload = {
+                "text": f"*[{f.severity.value}]* {f.title}\n"
+                        f"_Target:_ `{cfg.target}` | _Phase:_ `{f.phase}`\n"
+                        f"{f.description[:1500]}"
+            }
+
+        proxies = {"http": cfg.proxy, "https": cfg.proxy} if cfg.proxy else None
+        resp = requests.post(url, json=payload, timeout=5, verify=False, proxies=proxies)
+
+        if resp.status_code >= 400:
+            if logger:
+                logger.warning(f"Webhook notification failed: HTTP {resp.status_code}")
+        elif logger:
+            logger.debug(f"Webhook notification sent for {f.severity.value}: {f.title}")
+
+    except requests.exceptions.Timeout:
+        if logger:
+            logger.warning("Webhook notification timed out")
+    except requests.exceptions.RequestException as e:
+        if logger:
+            logger.warning(f"Webhook notification failed: {type(e).__name__}: {e}")
+    except Exception as e:
+        if logger:
+            logger.error(f"Unexpected error in webhook notification: {e}")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PENTESTDB PUSHER
@@ -386,26 +469,42 @@ def pentestdb_push(f: Finding, cfg: ScanConfig):
     Adapt endpoint path to match your deployment."""
     if not cfg.pentestdb_url:
         return
-    endpoint = cfg.pentestdb_url.rstrip('/') + "/api/findings"
-    payload = {
-        "target":         cfg.target,
-        "title":          f.title,
-        "severity":       f.severity.value,
-        "description":    f.description,
-        "evidence":       f.evidence,
-        "recommendation": f.recommendation,
-        "phase":          f.phase,
-        "timestamp":      f.timestamp,
-        "tool":           f"WebRecon v{VERSION}",
-    }
-    headers = {"Content-Type": "application/json"}
-    if cfg.pentestdb_token:
-        headers["Authorization"] = f"Bearer {cfg.pentestdb_token}"
+
     try:
-        requests.post(endpoint, json=payload, headers=headers,
-                      timeout=10, verify=False)
-    except Exception:
-        pass
+        endpoint = cfg.pentestdb_url.rstrip('/') + "/api/findings"
+        payload = {
+            "target":         cfg.target,
+            "title":          f.title,
+            "severity":       f.severity.value,
+            "description":    f.description,
+            "evidence":       f.evidence,
+            "recommendation": f.recommendation,
+            "phase":          f.phase,
+            "timestamp":      f.timestamp,
+            "tool":           f"WebRecon v{VERSION}",
+        }
+        headers = {"Content-Type": "application/json"}
+        if cfg.pentestdb_token:
+            headers["Authorization"] = f"Bearer {cfg.pentestdb_token}"
+
+        resp = requests.post(endpoint, json=payload, headers=headers,
+                            timeout=10, verify=False)
+
+        if resp.status_code >= 400:
+            if logger:
+                logger.warning(f"PentestDB push failed: HTTP {resp.status_code}")
+        elif logger:
+            logger.debug(f"Finding pushed to PentestDB: {f.title}")
+
+    except requests.exceptions.Timeout:
+        if logger:
+            logger.warning("PentestDB push timed out")
+    except requests.exceptions.RequestException as e:
+        if logger:
+            logger.warning(f"PentestDB push failed: {type(e).__name__}: {e}")
+    except Exception as e:
+        if logger:
+            logger.error(f"Unexpected error pushing to PentestDB: {e}")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SCOPE ENFORCEMENT (fixed: IPv6, resolved-IP check)
@@ -474,34 +573,82 @@ class ScanState:
         self._target = target
         self._done: List[str] = []
         self._start  = datetime.now().isoformat()
+
         if os.path.exists(state_file):
             try:
-                d = json.load(open(state_file))
-                saved_target = d.get("target")
-                # Target mismatch → auto-clear to prevent cross-target state collision
-                if saved_target and saved_target != target:
-                    print(f"{Fore.YELLOW}  [STATE] Previous state was for '{saved_target}' — "
-                          f"clearing (current target: '{target}')")
-                    os.remove(state_file)
-                    return
-                self._done  = d.get("done", [])
-                self._start = d.get("start", self._start)
-                if self._done:
-                    print(f"{Fore.YELLOW}  [RESUME] Completed phases: {', '.join(self._done)}")
-            except Exception:
-                pass
+                with open(state_file, 'r') as fh:
+                    d = json.load(fh)
+                    saved_target = d.get("target")
+
+                    # Target mismatch → auto-clear to prevent cross-target state collision
+                    if saved_target and saved_target != target:
+                        print(f"{Fore.YELLOW}  [STATE] Previous state was for '{saved_target}' — "
+                              f"clearing (current target: '{target}')")
+                        try:
+                            os.remove(state_file)
+                        except OSError as e:
+                            if logger:
+                                logger.warning(f"Failed to remove old state file: {e}")
+                        return
+
+                    self._done  = d.get("done", [])
+                    self._start = d.get("start", self._start)
+
+                    if self._done:
+                        print(f"{Fore.YELLOW}  [RESUME] Completed phases: {', '.join(self._done)}")
+                        if logger:
+                            logger.info(f"Resuming scan with completed phases: {self._done}")
+
+            except json.JSONDecodeError as e:
+                if logger:
+                    logger.warning(f"Corrupted state file (invalid JSON): {e}. Starting fresh.")
+                print(f"{Fore.YELLOW}  [STATE] State file corrupted, starting fresh.")
+            except IOError as e:
+                if logger:
+                    logger.warning(f"Failed to read state file: {e}")
+                print(f"{Fore.YELLOW}  [STATE] Could not read state file, starting fresh.")
+            except Exception as e:
+                if logger:
+                    logger.error(f"Unexpected error loading state: {e}")
+                print(f"{Fore.YELLOW}  [STATE] Unexpected error loading state, starting fresh.")
 
     def done(self, phase: str) -> bool:
         return phase in self._done
 
     def mark(self, phase: str):
+        """Mark a phase as complete. Uses atomic write to prevent corruption."""
         if phase not in self._done:
             self._done.append(phase)
-            json.dump({"target":  self._target,
-                       "done":    self._done,
-                       "start":   self._start,
-                       "updated": datetime.now().isoformat()},
-                      open(self._file, 'w'), indent=2)
+
+            try:
+                # Write to a temporary file first, then rename (atomic on POSIX)
+                temp_file = self._file + ".tmp"
+                with open(temp_file, 'w') as fh:
+                    json.dump({
+                        "target":  self._target,
+                        "done":    self._done,
+                        "start":   self._start,
+                        "updated": datetime.now().isoformat()
+                    }, fh, indent=2)
+
+                # Atomic rename
+                if os.name == 'nt':  # Windows
+                    if os.path.exists(self._file):
+                        os.replace(temp_file, self._file)
+                    else:
+                        os.rename(temp_file, self._file)
+                else:  # POSIX
+                    os.replace(temp_file, self._file)
+
+                if logger:
+                    logger.debug(f"Marked phase as complete: {phase}")
+
+            except IOError as e:
+                if logger:
+                    logger.error(f"Failed to write state file: {e}")
+            except Exception as e:
+                if logger:
+                    logger.error(f"Unexpected error marking phase: {e}")
 
     def clear(self):
         self._done = []
@@ -535,30 +682,61 @@ def save_findings(findings: List[Finding], path: str):
 
 def run_cmd(cmd: List[str], desc: str, output_file: str, config: ScanConfig,
             timeout: int = 300) -> Tuple[str, str, int]:
+    """Execute a command safely with proper error handling and logging."""
     print(f"{Fore.YELLOW}  → {desc}")
     _log(output_file, f"\n## {desc}\n**`{' '.join(cmd)}`**")
+
     try:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            text=True, timeout=timeout)
+
         if r.stdout:
             _log(output_file, f"```\n{r.stdout.strip()}\n```")
-        if r.stderr and config.verbose:
-            _log(output_file, f"**stderr:**\n```\n{r.stderr.strip()}\n```")
+
+        if r.stderr:
+            if config.verbose:
+                _log(output_file, f"**stderr:**\n```\n{r.stderr.strip()}\n```")
+            if r.returncode != 0 and logger:
+                logger.debug(f"{desc} stderr: {r.stderr[:200]}")
+
         icon = Fore.GREEN + "✓" if r.returncode == 0 else Fore.RED + "✗"
         print(f"  {icon} {desc}")
+
+        if r.returncode != 0 and logger:
+            logger.warning(f"{desc} returned non-zero exit code: {r.returncode}")
+
         return r.stdout, r.stderr, r.returncode
-    except subprocess.TimeoutExpired:
+
+    except subprocess.TimeoutExpired as e:
         msg = f"TIMEOUT after {timeout}s"
         print(f"  {Fore.RED}⏱ {desc}: {msg}")
         _log(output_file, f"> ⚠️ {msg}")
+        if logger:
+            logger.error(f"{desc} timed out: {e}")
         return "", "", -1
-    except FileNotFoundError:
-        print(f"  {Fore.RED}✗ Not found: {cmd[0]}")
-        _log(output_file, f"> ⚠️ {cmd[0]} not installed")
+
+    except FileNotFoundError as e:
+        msg = f"Not found: {cmd[0]}"
+        print(f"  {Fore.RED}✗ {msg}")
+        _log(output_file, f"> ⚠️ {msg}")
+        if logger:
+            logger.error(f"Tool not found: {cmd[0]} - {e}")
+        raise ToolNotFound(f"Tool '{cmd[0]}' not found in PATH") from e
+
+    except PermissionError as e:
+        msg = f"Permission denied: {cmd[0]}"
+        print(f"  {Fore.RED}✗ {msg}")
+        _log(output_file, f"> ⚠️ {msg}")
+        if logger:
+            logger.error(f"Permission error running {cmd[0]}: {e}")
         return "", "", -1
+
     except Exception as e:
-        print(f"  {Fore.RED}✗ {e}")
-        _log(output_file, f"> ⚠️ {e}")
+        msg = f"Error executing {desc}: {type(e).__name__}: {str(e)[:100]}"
+        print(f"  {Fore.RED}✗ {msg}")
+        _log(output_file, f"> ⚠️ {msg}")
+        if logger:
+            logger.exception(f"Failed to execute {desc}")
         return "", "", -1
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -587,31 +765,76 @@ def make_session(config: ScanConfig) -> "requests.Session":
     return s
 
 def detect_scheme(target: str, config: ScanConfig) -> str:
+    """Detect if target responds to https or http. Defaults to http if both fail."""
     sess = make_session(config)
     for scheme in ("https", "http"):
         try:
-            sess.get(f"{scheme}://{target}", timeout=config.timeout,
-                     allow_redirects=False)
+            resp = sess.get(f"{scheme}://{target}", timeout=config.timeout,
+                           allow_redirects=False)
             print(f"{Fore.GREEN}  ✓ Scheme detected: {scheme}")
+            if logger:
+                logger.info(f"Detected scheme for {target}: {scheme}")
             return scheme
-        except Exception:
+        except requests.exceptions.ConnectionError as e:
+            if logger:
+                logger.debug(f"{scheme} connection failed for {target}: {e}")
             continue
+        except requests.exceptions.Timeout as e:
+            if logger:
+                logger.debug(f"{scheme} timeout for {target}: {e}")
+            continue
+        except Exception as e:
+            if logger:
+                logger.debug(f"Error detecting {scheme} for {target}: {e}")
+            continue
+
+    if logger:
+        logger.warning(f"Could not detect scheme for {target}, defaulting to http")
     return "http"
 
 def revalidate_session(cfg: ScanConfig, out: str) -> bool:
-    """If auth-check-url/text configured, verify session is still authenticated."""
+    """Verify session is still authenticated if auth-check-url/text configured."""
     if not cfg.auth_check_url or not cfg.auth_check_text:
         return True
+
     try:
         sess = make_session(cfg)
         r = sess.get(cfg.auth_check_url, timeout=cfg.timeout)
+
         if cfg.auth_check_text in r.text:
+            if logger:
+                logger.info(f"Session authentication verified at {cfg.auth_check_url}")
             return True
-        print(f"  {Fore.RED}⚠ Auth check failed — session may have expired!")
-        _log(out, f"> ⚠️ Auth check failed at {cfg.auth_check_url}")
+
+        msg = f"Auth check failed — session may have expired!"
+        print(f"  {Fore.RED}⚠ {msg}")
+        _log(out, f"> ⚠️ {msg}")
+        if logger:
+            logger.warning(f"Auth check failed: expected text not found in {cfg.auth_check_url}")
         return False
+
+    except requests.exceptions.Timeout as e:
+        msg = f"Auth check timeout at {cfg.auth_check_url}"
+        print(f"  {Fore.YELLOW}⚠ {msg}")
+        _log(out, f"> ⚠️ {msg}")
+        if logger:
+            logger.warning(f"Auth check timeout: {e}")
+        return False
+
+    except requests.exceptions.RequestException as e:
+        msg = f"Auth check network error: {e}"
+        print(f"  {Fore.YELLOW}⚠ {msg}")
+        _log(out, f"> ⚠️ {msg}")
+        if logger:
+            logger.error(f"Auth check failed with network error: {e}")
+        return False
+
     except Exception as e:
-        print(f"  {Fore.YELLOW}⚠ Auth check error: {e}")
+        msg = f"Auth check error: {type(e).__name__}: {str(e)[:80]}"
+        print(f"  {Fore.YELLOW}⚠ {msg}")
+        _log(out, f"> ⚠️ {msg}")
+        if logger:
+            logger.exception(f"Unexpected error in auth check")
         return False
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -622,13 +845,18 @@ _MISSING_TOOLS: Set[str] = set()
 _MISSING_TOOLS_LOCK = threading.Lock()
 
 def _tool_ok(name: str, output_file: str) -> bool:
+    """Check if a tool is available in PATH. Logs and tracks if missing."""
     if shutil.which(name):
         return True
     with _MISSING_TOOLS_LOCK:
         _MISSING_TOOLS.add(name)
     msg = f"{name} not installed — skipping"
-    print(f"  {Fore.YELLOW}⚠ {msg}")
-    _log(output_file, f"> ⚠️ {msg}")
+    try:
+        print(f"  {Fore.YELLOW}⚠ {msg}")
+        _log(output_file, f"> ⚠️ {msg}")
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to log tool check: {e}")
     return False
 
 def _is_root() -> bool:
@@ -1929,9 +2157,25 @@ def phase_jwt_analysis(target: str, cfg: ScanConfig, out: str, st: ScanState):
     for jwt in list(jwts)[:10]:
         try:
             parts = jwt.split('.')
-            if len(parts) != 3: continue
-            header = json.loads(_b64url_decode(parts[0]))
-            payload = json.loads(_b64url_decode(parts[1]))
+            if len(parts) != 3:
+                if logger:
+                    logger.debug(f"Skipping malformed JWT (expected 3 parts, got {len(parts)})")
+                continue
+
+            try:
+                header = json.loads(_b64url_decode(parts[0]))
+            except Exception as e:
+                if logger:
+                    logger.debug(f"Failed to decode JWT header: {e}")
+                continue
+
+            try:
+                payload = json.loads(_b64url_decode(parts[1]))
+            except Exception as e:
+                if logger:
+                    logger.debug(f"Failed to decode JWT payload: {e}")
+                continue
+
             _log(out, f"\n### JWT\n- Header: `{header}`\n- Payload (truncated): `{json.dumps(payload)[:300]}`")
 
             # alg:none
@@ -4235,7 +4479,12 @@ def _load_targets(args) -> List[str]:
 
 
 def main():
+    global logger
     args = parse_args()
+
+    # Initialize logging
+    logger = setup_logging(verbose=args.verbose)
+    logger.info(f"WebRecon v{VERSION} starting")
 
     print(f"\n{Fore.MAGENTA}{'═'*60}")
     print(f"{Fore.MAGENTA}  WebRecon v{VERSION}")
@@ -4508,11 +4757,29 @@ def run_single_target(args, target, tt, scope, output_prefix):
         interrupted = True
         print(f"\n{Fore.YELLOW}  Interrupted — state saved. Re-run with --resume to continue.")
         _log(out, "\n\n---\n*Scan interrupted by user.*")
+        if logger:
+            logger.info("Scan interrupted by user")
+
+    except ConfigError as e:
+        print(f"{Fore.RED}  Configuration Error: {e}")
+        _log(out, f"\n\n---\n*Configuration Error: {e}*")
+        if logger:
+            logger.error(f"Configuration error: {e}")
+
+    except NetworkError as e:
+        print(f"{Fore.RED}  Network Error: {e}")
+        _log(out, f"\n\n---\n*Network Error: {e}*")
+        if logger:
+            logger.error(f"Network error: {e}")
 
     except Exception as e:
         import traceback
-        print(f"{Fore.RED}  Fatal: {e}")
-        traceback.print_exc()
+        print(f"{Fore.RED}  Fatal Error: {type(e).__name__}: {e}")
+        _log(out, f"\n\n---\n*Fatal Error: {type(e).__name__}: {e}*")
+        if logger:
+            logger.exception("Fatal error during scan")
+        if args.verbose:
+            traceback.print_exc()
 
     finally:
         save_findings(_findings, findings)
