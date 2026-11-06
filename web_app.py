@@ -120,6 +120,50 @@ try:
 except ImportError:
     HAS_CONFIG = False
 
+# ── Reporting module ──────────────────────────────────────────────────────────
+try:
+    from web_app.reporting import write_html_report
+except ImportError:
+    # Fallback: define stub if module not available
+    def write_html_report(*args, **kwargs):
+        raise ImportError("web_app.reporting module not available")
+
+# ── Output module ─────────────────────────────────────────────────────────────
+try:
+    from web_app.utils.output import (
+        _log, section, _log_finding_to_report, save_findings, run_cmd
+    )
+except ImportError:
+    # Fallback: define stubs if module not available
+    def _log(*args, **kwargs):
+        raise ImportError("web_app.utils.output module not available")
+    def section(*args, **kwargs):
+        raise ImportError("web_app.utils.output module not available")
+    def _log_finding_to_report(*args, **kwargs):
+        raise ImportError("web_app.utils.output module not available")
+    def save_findings(*args, **kwargs):
+        raise ImportError("web_app.utils.output module not available")
+    def run_cmd(*args, **kwargs):
+        raise ImportError("web_app.utils.output module not available")
+
+# ── Helpers module ────────────────────────────────────────────────────────────
+try:
+    from web_app.utils.helpers import (
+        normalise, validate, sanitise, yes_no, diff_findings
+    )
+except ImportError:
+    # Fallback: define stubs if module not available
+    def normalise(raw: str) -> str:
+        raise ImportError("web_app.utils.helpers module not available")
+    def validate(target: str):
+        raise ImportError("web_app.utils.helpers module not available")
+    def sanitise(value: str) -> str:
+        raise ImportError("web_app.utils.helpers module not available")
+    def yes_no(prompt: str) -> bool:
+        raise ImportError("web_app.utils.helpers module not available")
+    def diff_findings(current, prev_file: str):
+        raise ImportError("web_app.utils.helpers module not available")
+
 # ── Dependency checks ────────────────────────────────────────────────────────
 _MISSING = []
 try:
@@ -395,22 +439,6 @@ def add_finding(f: Finding, output_file: str, cfg: Optional[ScanConfig] = None):
             if cfg.verbose:
                 print(f"  {Fore.YELLOW}⚠ pentestdb: {e}")
 
-def _log_finding_to_report(f: Finding, output_file: str):
-    icons = {Severity.INFO:"ℹ️", Severity.LOW:"🟢",
-             Severity.MEDIUM:"🟡", Severity.HIGH:"🔴", Severity.CRITICAL:"🚨"}
-    icon = icons.get(f.severity, "")
-    lines = [
-        f"\n### {icon} [{f.severity.value}] {f.title}",
-        f"**Phase:** {f.phase}  |  **Time:** {f.timestamp}\n",
-        f"**Description:** {f.description}\n",
-    ]
-    if f.evidence:
-        lines.append(f"**Evidence:**\n```\n{f.evidence[:1500]}\n```\n")
-    if f.recommendation:
-        lines.append(f"**Recommendation:** {f.recommendation}\n")
-    lines.append("---")
-    _log(output_file, '\n'.join(lines))
-
 # ═════════════════════════════════════════════════════════════════════════════
 # WEBHOOK NOTIFIER (Discord / Slack compatible)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -663,90 +691,6 @@ class ScanState:
             os.remove(self._file)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# OUTPUT HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
-
-_log_lock = threading.Lock()
-
-def _log(output_file: str, msg: str):
-    with _log_lock:
-        with open(output_file, 'a') as fh:
-            fh.write(msg + '\n')
-
-def section(title: str, output_file: str):
-    print(f"\n{Fore.BLUE}{'─'*55}")
-    print(f"{Fore.BLUE}  {title}")
-    print(f"{Fore.BLUE}{'─'*55}")
-    _log(output_file, f"\n\n---\n# {title}\n")
-
-def save_findings(findings: List[Finding], path: str):
-    with open(path, 'w') as fh:
-        json.dump([asdict(f) for f in findings], fh, indent=2, default=str)
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SUBPROCESS RUNNER (shell=False)
-# ═════════════════════════════════════════════════════════════════════════════
-
-def run_cmd(cmd: List[str], desc: str, output_file: str, config: ScanConfig,
-            timeout: int = 300) -> Tuple[str, str, int]:
-    """Execute a command safely with proper error handling and logging."""
-    print(f"{Fore.YELLOW}  → {desc}")
-    _log(output_file, f"\n## {desc}\n**`{' '.join(cmd)}`**")
-
-    try:
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, timeout=timeout)
-
-        if r.stdout:
-            _log(output_file, f"```\n{r.stdout.strip()}\n```")
-
-        if r.stderr:
-            if config.verbose:
-                _log(output_file, f"**stderr:**\n```\n{r.stderr.strip()}\n```")
-            if r.returncode != 0 and logger:
-                logger.debug(f"{desc} stderr: {r.stderr[:200]}")
-
-        icon = Fore.GREEN + "✓" if r.returncode == 0 else Fore.RED + "✗"
-        print(f"  {icon} {desc}")
-
-        if r.returncode != 0 and logger:
-            logger.warning(f"{desc} returned non-zero exit code: {r.returncode}")
-
-        return r.stdout, r.stderr, r.returncode
-
-    except subprocess.TimeoutExpired as e:
-        msg = f"TIMEOUT after {timeout}s"
-        print(f"  {Fore.RED}⏱ {desc}: {msg}")
-        _log(output_file, f"> ⚠️ {msg}")
-        if logger:
-            logger.error(f"{desc} timed out: {e}")
-        return "", "", -1
-
-    except FileNotFoundError as e:
-        msg = f"Not found: {cmd[0]}"
-        print(f"  {Fore.RED}✗ {msg}")
-        _log(output_file, f"> ⚠️ {msg}")
-        if logger:
-            logger.error(f"Tool not found: {cmd[0]} - {e}")
-        raise ToolNotFound(f"Tool '{cmd[0]}' not found in PATH") from e
-
-    except PermissionError as e:
-        msg = f"Permission denied: {cmd[0]}"
-        print(f"  {Fore.RED}✗ {msg}")
-        _log(output_file, f"> ⚠️ {msg}")
-        if logger:
-            logger.error(f"Permission error running {cmd[0]}: {e}")
-        return "", "", -1
-
-    except Exception as e:
-        msg = f"Error executing {desc}: {type(e).__name__}: {str(e)[:100]}"
-        print(f"  {Fore.RED}✗ {msg}")
-        _log(output_file, f"> ⚠️ {msg}")
-        if logger:
-            logger.exception(f"Failed to execute {desc}")
-        return "", "", -1
-
-# ═════════════════════════════════════════════════════════════════════════════
 # HTTP SESSION (auth-aware, rate-limited)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -873,58 +817,12 @@ def _sudo() -> List[str]:
     return [] if _is_root() else ["sudo"]
 
 # ═════════════════════════════════════════════════════════════════════════════
-# INPUT HELPERS (loosened sanitise: allow host:port)
+# INPUT HELPERS (imported from web_app.utils.helpers)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def normalise(raw: str) -> str:
-    raw = raw.strip()
-    if re.match(r'^https?://', raw, re.I):
-        return urlparse(raw).netloc
-    return raw.rstrip('/')
-
-def validate(target: str) -> Optional[TargetType]:
-    if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', target):
-        try:
-            ipaddress.IPv4Address(target)
-            return TargetType.IP
-        except ValueError:
-            return None
-    if re.match(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$', target):
-        return TargetType.DOMAIN
-    # Allow host:port
-    if re.match(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}:\d{1,5}$', target):
-        return TargetType.DOMAIN
-    return None
-
-def sanitise(value: str) -> str:
-    # Loosened: colon allowed (for host:port). Still blocks shell metachars.
-    if re.search(r'[;&|`$<>()\\\'"{}]', value):
-        raise ValueError(f"Unsafe characters in input: {value!r}")
-    return value
-
-def yes_no(prompt: str) -> bool:
-    while True:
-        ans = input(f"{Fore.CYAN}  {prompt} (y/n): ").strip().lower()
-        if ans in ('y', 'yes'): return True
-        if ans in ('n', 'no'):  return False
-
 # ═════════════════════════════════════════════════════════════════════════════
-# DIFF MODE
+# DIFF MODE (imported from web_app.utils.helpers)
 # ═════════════════════════════════════════════════════════════════════════════
-
-def diff_findings(current: List[Finding], prev_file: str) -> Dict:
-    if not os.path.exists(prev_file):
-        return {}
-    try:
-        prev = {f['title'] for f in json.load(open(prev_file))}
-        curr = {f.title for f in current}
-        return {
-            "new":       [asdict(f) for f in current if f.title not in prev],
-            "resolved":  list(prev - curr),
-            "unchanged": len(curr & prev),
-        }
-    except Exception:
-        return {}
 
 # ═════════════════════════════════════════════════════════════════════════════
 # CATCH-ALL DETECTION
@@ -4199,140 +4097,6 @@ def write_summary(cfg: ScanConfig, out: str, findings: List[Finding], start: dat
                 _log(out, "\n### Resolved\n" + '\n'.join(f"- {t}" for t in diff['resolved']))
 
 
-def write_html_report(cfg: ScanConfig, html_path: str,
-                       findings: List[Finding], start: datetime):
-    """Emit a self-contained filterable HTML report."""
-    duration = datetime.now() - start
-    counts = Counter(f.severity for f in findings)
-    rows = []
-    for i, f in enumerate(sorted(findings, key=lambda x: -_SEV_ORDER[x.severity])):
-        rows.append({
-            "id": i, "title": f.title, "severity": f.severity.value,
-            "description": f.description, "evidence": f.evidence,
-            "recommendation": f.recommendation, "phase": f.phase,
-            "timestamp": f.timestamp,
-        })
-
-    # Escape helper
-    def esc(s):
-        return (str(s).replace('&', '&amp;').replace('<', '&lt;')
-                .replace('>', '&gt;').replace('"', '&quot;'))
-
-    sev_colour = {
-        "CRITICAL": "#8b0000", "HIGH": "#e74c3c", "MEDIUM": "#f39c12",
-        "LOW":      "#27ae60", "INFO": "#3498db",
-    }
-
-    table_rows = ""
-    for r in rows:
-        c = sev_colour.get(r['severity'], '#555')
-        table_rows += (
-            f'<tr class="row" data-sev="{r["severity"]}">'
-            f'<td><span class="badge" style="background:{c}">{r["severity"]}</span></td>'
-            f'<td>{esc(r["title"])}</td>'
-            f'<td>{esc(r["phase"])}</td>'
-            f'<td><details><summary>show</summary>'
-            f'<p><b>Description:</b> {esc(r["description"])}</p>'
-            f'<pre>{esc(r["evidence"])}</pre>'
-            f'<p><b>Recommendation:</b> {esc(r["recommendation"])}</p>'
-            f'<p><i>Time:</i> {esc(r["timestamp"])}</p>'
-            f'</details></td></tr>'
-        )
-
-    summary_cards = ""
-    for sev in (Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO):
-        c = sev_colour[sev.value]
-        summary_cards += (f'<div class="card" style="border-left-color:{c}">'
-                          f'<div class="sev">{sev.value}</div>'
-                          f'<div class="num">{counts.get(sev, 0)}</div></div>')
-
-    html = f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<title>WebRecon Report — {esc(cfg.target)}</title>
-<style>
- * {{ box-sizing:border-box; }}
- body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-        margin:0; background:#0d1117; color:#c9d1d9; }}
- header {{ background:#161b22; padding:1.5rem 2rem; border-bottom:1px solid #30363d; }}
- h1 {{ margin:0; color:#58a6ff; }}
- .meta {{ color:#8b949e; font-size:.9rem; margin-top:.5rem; }}
- main {{ padding:2rem; max-width:1400px; margin:auto; }}
- .cards {{ display:grid; grid-template-columns:repeat(5, 1fr); gap:1rem; margin-bottom:2rem; }}
- .card {{ background:#161b22; padding:1rem; border-left:4px solid; border-radius:4px; }}
- .sev {{ font-size:.8rem; color:#8b949e; text-transform:uppercase; }}
- .num {{ font-size:2rem; font-weight:bold; color:#f0f6fc; }}
- .filters {{ margin-bottom:1rem; }}
- .filters button {{ background:#21262d; color:#c9d1d9; border:1px solid #30363d;
-                   padding:.5rem 1rem; margin-right:.5rem; border-radius:4px; cursor:pointer; }}
- .filters button.active {{ background:#1f6feb; border-color:#1f6feb; color:white; }}
- input[type=text] {{ background:#0d1117; color:#c9d1d9; border:1px solid #30363d;
-                    padding:.5rem; width:300px; border-radius:4px; }}
- table {{ width:100%; border-collapse:collapse; background:#161b22; border-radius:4px; overflow:hidden; }}
- th, td {{ padding:.75rem; text-align:left; border-bottom:1px solid #30363d; vertical-align:top; }}
- th {{ background:#21262d; color:#f0f6fc; font-weight:600; }}
- tr:hover {{ background:#1c2128; }}
- .badge {{ color:white; padding:.25rem .5rem; border-radius:3px; font-size:.75rem; font-weight:bold; }}
- pre {{ background:#0d1117; padding:.75rem; border-radius:4px; overflow:auto;
-       white-space:pre-wrap; word-break:break-all; max-height:400px; }}
- details summary {{ cursor:pointer; color:#58a6ff; }}
- details[open] summary {{ margin-bottom:.5rem; }}
-</style></head>
-<body>
-<header>
- <h1>WebRecon Report</h1>
- <div class="meta">
-  <b>Target:</b> {esc(cfg.target)} &nbsp;|&nbsp;
-  <b>Base URL:</b> {esc(cfg.base_url)} &nbsp;|&nbsp;
-  <b>Profile:</b> {esc(cfg.profile.value)} &nbsp;|&nbsp;
-  <b>Started:</b> {start.isoformat()} &nbsp;|&nbsp;
-  <b>Duration:</b> {str(duration).split('.')[0]} &nbsp;|&nbsp;
-  <b>Total:</b> {len(findings)} findings
- </div>
-</header>
-<main>
- <div class="cards">{summary_cards}</div>
-
- <div class="filters">
-  <button class="filterbtn active" data-f="ALL">All</button>
-  <button class="filterbtn" data-f="CRITICAL">Critical</button>
-  <button class="filterbtn" data-f="HIGH">High</button>
-  <button class="filterbtn" data-f="MEDIUM">Medium</button>
-  <button class="filterbtn" data-f="LOW">Low</button>
-  <button class="filterbtn" data-f="INFO">Info</button>
-  <input type="text" id="search" placeholder="Search findings…">
- </div>
-
- <table>
-  <thead><tr><th>Severity</th><th>Title</th><th>Phase</th><th>Details</th></tr></thead>
-  <tbody>{table_rows}</tbody>
- </table>
-</main>
-<script>
- const btns = document.querySelectorAll('.filterbtn');
- const rows = document.querySelectorAll('tr.row');
- const search = document.getElementById('search');
- let activeFilter = 'ALL';
- function apply() {{
-   const q = search.value.toLowerCase();
-   rows.forEach(r => {{
-     const sev = r.dataset.sev;
-     const text = r.textContent.toLowerCase();
-     const sevOk = activeFilter === 'ALL' || sev === activeFilter;
-     const textOk = !q || text.includes(q);
-     r.style.display = (sevOk && textOk) ? '' : 'none';
-   }});
- }}
- btns.forEach(b => b.addEventListener('click', () => {{
-   btns.forEach(x => x.classList.remove('active'));
-   b.classList.add('active');
-   activeFilter = b.dataset.f;
-   apply();
- }}));
- search.addEventListener('input', apply);
-</script>
-</body></html>"""
-    with open(html_path, 'w') as fh:
-        fh.write(html)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ARGUMENT PARSING & MAIN
