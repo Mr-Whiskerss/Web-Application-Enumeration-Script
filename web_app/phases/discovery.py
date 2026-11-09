@@ -464,7 +464,10 @@ def phase_param_discovery(target: str, cfg:"ScanConfig", out: str, st:"ScanState
     open(urls_file, 'w').write('\n'.join(urls_to_probe))
 
     cmd = ["arjun", "-i", urls_file, "-oJ", output_file,
-           "-t", str(min(cfg.threads * 2, 10)), "--stable"]
+           "-t", str(min(cfg.threads * 2, 10))]
+    # --stable forces 1 thread + 6-12s per-request delay; only viable for stealth.
+    if cfg.profile == "stealth":
+        cmd.append("--stable")
     if cfg.cookie:
         cmd += ["--headers", f"Cookie: {cfg.cookie}"]
     run_cmd(cmd, "arjun parameter discovery", out, cfg, cfg.arjun_timeout)
