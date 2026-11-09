@@ -2041,10 +2041,9 @@ def phase_jwt_analysis(target: str, cfg: ScanConfig, out: str, st: ScanState):
     sess = make_session(cfg)
     try:
         r = sess.get(cfg.base_url, timeout=cfg.timeout)
-        for cookie_name in r.cookies:
-            cookie_value = r.cookies.get(cookie_name)
-            if cookie_value and re.match(r'^eyJ', cookie_value):
-                jwts.add(cookie_value)
+        for c in r.cookies:
+            if c.value and re.match(r'^eyJ', c.value):
+                jwts.add(c.value)
         # Body scan
         for m in re.finditer(r'(eyJ[A-Za-z0-9_/+\-]{10,}\.[A-Za-z0-9_/+\-]{10,}\.[A-Za-z0-9_/+\-]{10,})',
                              r.text):
@@ -4308,6 +4307,7 @@ def main():
         tt = validate(t)
         if not tt:
             print(f"{Fore.YELLOW}  [SKIP] Invalid target: {t!r}"); continue
+        tt = TargetType(tt)
         try:
             sanitise(t)
         except ValueError as e:

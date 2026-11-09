@@ -883,6 +883,7 @@ def main():
         if not tt:
             print(f"{Fore.YELLOW}  [SKIP] Invalid target: {t!r}")
             continue
+        tt = TargetType(tt)
         try:
             sanitise(t)
         except ValueError as e:
