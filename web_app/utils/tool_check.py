@@ -25,8 +25,7 @@ def _tool_ok(name: str, output_file: str) -> bool:
     try:
         from colorama import Fore
         print(f"  {Fore.YELLOW}⚠ {msg}")
-        # Import _log from parent module to avoid circular dependency
-        from web_app import _log
+        from web_app.utils.output import _log
         _log(output_file, f"> ⚠️ {msg}")
     except Exception as e:
         import logging

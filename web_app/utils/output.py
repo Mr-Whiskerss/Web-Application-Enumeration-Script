@@ -126,8 +126,8 @@ def run_cmd(cmd: List[str], desc: str, output_file: str, config,
     Raises:
         ToolNotFound: If the command executable is not found in PATH.
     """
-    # Import here to avoid circular dependencies
-    from web_app import logger, ToolNotFound
+    from web_app.utils.subprocess_runner import ToolNotFound
+    logger = logging.getLogger("webrecon")
 
     print(f"{Fore.YELLOW}  → {desc}")
     _log(output_file, f"\n## {desc}\n**`{' '.join(cmd)}`**")

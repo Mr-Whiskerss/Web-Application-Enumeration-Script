@@ -40,8 +40,7 @@ def write_html_report(cfg, html_path: str,
     Returns:
         None (writes to html_path)
     """
-    # Import here to avoid circular dependency
-    from web_app.core.models import Severity
+    from web_app.core.findings import Severity
 
     # Severity ordering for sorting
     _SEV_ORDER = {Severity.INFO:0, Severity.LOW:1, Severity.MEDIUM:2,
